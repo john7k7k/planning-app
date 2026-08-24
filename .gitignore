@@ -1,0 +1,32 @@
+# Gradle build state and generated output
+.gradle/
+build/
+**/build/
+.kotlin/
+
+# Local Android SDK configuration (machine-specific)
+local.properties
+
+# Android Studio / IntelliJ project files
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# Native build intermediates
+.externalNativeBuild/
+.cxx/
+
+# Generated Android packages and captures
+*.apk
+*.aab
+captures/
+
+# Signing credentials
+*.jks
+*.keystore
+keystore.properties
+
+# OS-generated files
+.DS_Store
+Thumbs.db
