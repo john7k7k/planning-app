@@ -166,6 +166,7 @@ private data class RewardEntry(val reward: RewardSchedule) : TimelineEntry {
 private fun Dashboard(state: MissionUiState, vm: MissionViewModel, chooseDate: () -> Unit) {
     var settling by remember { mutableStateOf<TaskCardModel?>(null) }
     var editing by remember { mutableStateOf<TaskCardModel?>(null) }
+    var reviewing by remember { mutableStateOf<TaskCardModel?>(null) }
     var editingReward by remember { mutableStateOf<RewardSchedule?>(null) }
     var quickAdd by remember { mutableStateOf(false) }
     val data = if (state.isDateLoading) null else state.dashboard
@@ -212,10 +213,14 @@ private fun Dashboard(state: MissionUiState, vm: MissionViewModel, chooseDate: (
                             entry.card,
                             state.categories.firstOrNull { it.id == entry.card.task.categoryId },
                             onSettle = { settling = entry.card },
-                            onEdit = { editing = entry.card }
+                            onEdit = { if (entry.card.instance.settled) reviewing = entry.card else editing = entry.card }
                         )
                         is RewardEntry -> RewardTimelineItem(entry.reward) { editingReward = entry.reward }
                     }
+                }
+                item {
+                    val summary = state.dailySummaries.firstOrNull { it.date == state.selectedDate.toString() }?.content.orEmpty()
+                    DailySummaryCard(state.selectedDate, summary) { vm.saveDailySummary(state.selectedDate, it) }
                 }
             }
             item { Spacer(Modifier.height(92.dp)) }
@@ -232,6 +237,14 @@ private fun Dashboard(state: MissionUiState, vm: MissionViewModel, chooseDate: (
             vm.settle(card.instance.id, progress, result, checked)
             settling = null
         }
+    }
+    reviewing?.let { card ->
+        TaskReviewDialog(
+            card = card,
+            dismiss = { reviewing = null },
+            saveResult = { result -> vm.updateSettledResult(card.instance.id, result) },
+            undo = { error -> vm.undoSettlement(card.instance.id, onSuccess = { reviewing = null; editing = card }, onFailure = error) }
+        )
     }
     editing?.let { card ->
         InstanceEditDialog(
@@ -398,7 +411,7 @@ private fun TaskCard(card: TaskCardModel, category: TaskCategoryEntity?, onSettl
                         color = Color.Gray
                     )
                 }
-                IconButton(onEdit) { Icon(Icons.Default.Settings, "編輯任務") }
+                IconButton(onEdit) { Icon(if (card.instance.settled) Icons.Default.Visibility else Icons.Default.Settings, if (card.instance.settled) "查閱任務" else "編輯任務") }
             }
             if (task.description.isNotBlank()) {
                 Text(task.description, color = Color.Gray, maxLines = 1, modifier = Modifier.padding(top = 8.dp))
@@ -483,6 +496,57 @@ private fun SettleDialog(card: TaskCardModel, dismiss: () -> Unit, settle: (BigD
         },
         dismissButton = { TextButton(dismiss) { Text("取消") } }
     )
+}
+
+@Composable
+private fun TaskReviewDialog(card: TaskCardModel, dismiss: () -> Unit, saveResult: (String) -> Unit, undo: ((String) -> Unit) -> Unit) {
+    var result by remember(card.instance.id) { mutableStateOf(card.instance.result) }
+    var undoError by remember(card.instance.id) { mutableStateOf<String?>(null) }
+    AlertDialog(
+        onDismissRequest = dismiss,
+        title = { Text("查閱完成任務") },
+        text = { Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(card.task.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+            Text("${card.instance.scheduledDate} · ${card.task.startTime.ifBlank { "全天" }}${card.task.endTime.takeIf { it.isNotBlank() }?.let { " – $it" }.orEmpty()}", color = Color.Gray)
+            card.task.description.takeIf { it.isNotBlank() }?.let { Text(it) }
+            card.task.locationName.takeIf { it.isNotBlank() }?.let { Text("地點：$it", color = Color.Gray) }
+            Text("完成度 ${card.instance.completionPercentage.stripTrailingZeros().toPlainString()}% · 已獲得 🪙 ${card.instance.earnedCoins}　💎 ${card.instance.earnedDiamonds}", style = MaterialTheme.typography.bodySmall)
+            HorizontalDivider()
+            Field("任務結果／心得", result) { result = it }
+            Text("任務資訊如名稱、時間、獎勵等，需先撤回完成後才能編輯。", color = Color.Gray, style = MaterialTheme.typography.labelSmall)
+            undoError?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+        } },
+        confirmButton = { Button({ saveResult(result) }) { Text("儲存心得") } },
+        dismissButton = { Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            TextButton({ undoError = null; undo { undoError = it } }, colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)) { Text("撤回") }
+            TextButton(dismiss) { Text("關閉") }
+        } }
+    )
+}
+
+@Composable
+private fun DailySummaryCard(date: LocalDate, initial: String, save: (String) -> Unit) {
+    var editing by remember(date) { mutableStateOf(initial.isBlank()) }
+    var text by remember(date, initial) { mutableStateOf(initial) }
+    Card(colors = CardDefaults.cardColors(containerColor = Color(0xFFF2F0FF))) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("${date.format(DateTimeFormatter.ofPattern("M 月 d 日"))} 當日總結", fontWeight = FontWeight.Bold)
+                    Text("記錄今天的收穫、感受或明日提醒。", color = Color.Gray, style = MaterialTheme.typography.labelSmall)
+                }
+                IconButton({ editing = !editing }) { Icon(if (editing) Icons.Default.Close else Icons.Default.Edit, if (editing) "收起編輯" else "編輯總結") }
+            }
+            if (editing) {
+                Field("當日總結", text) { text = it }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                    OutlinedButton({ text = ""; save(""); editing = false }, Modifier.weight(1f)) { Text("清除") }
+                    Button({ save(text); editing = false }, Modifier.weight(1f)) { Text("儲存總結") }
+                }
+            } else if (text.isBlank()) Text("尚未撰寫當日總結。", color = Color.Gray)
+            else Text(text)
+        }
+    }
 }
 
 @Composable
@@ -944,8 +1008,8 @@ private fun Field(label: String, value: String, modifier: Modifier = Modifier.fi
         },
         label = { Text(label) },
         modifier = modifier,
-        singleLine = !label.contains("描述") && !label.contains("清單") && !label.contains("心得"),
-        minLines = if (label.contains("描述") || label.contains("清單") || label.contains("心得")) 3 else 1
+        singleLine = !label.contains("描述") && !label.contains("清單") && !label.contains("心得") && !label.contains("總結"),
+        minLines = if (label.contains("描述") || label.contains("清單") || label.contains("心得") || label.contains("總結")) 3 else 1
     )
 }
 
@@ -1156,6 +1220,21 @@ private fun MonthlySummary(state: MissionUiState, vm: MissionViewModel) {
                 Row(Modifier.fillMaxWidth().padding(18.dp), horizontalArrangement = Arrangement.SpaceBetween) {
                     Column { Text("本月實得獎勵", color = Color.White.copy(alpha = .7f)); Text("🪙 ${stats?.earnedCoins ?: 0}", color = Gold, fontWeight = FontWeight.Bold) }
                     Text("💎 ${stats?.earnedDiamonds ?: 0}", color = Diamond, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 22.dp))
+                }
+            }
+        }
+        item {
+            Card {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text("每日總結", fontWeight = FontWeight.Bold)
+                    val summaries = state.dailySummaries.filter { it.date.startsWith(month.toString()) }
+                    if (summaries.isEmpty()) Text("本月尚未撰寫每日總結。", color = Color.Gray)
+                    summaries.forEach { summary ->
+                        Column {
+                            Text(runCatching { LocalDate.parse(summary.date).format(DateTimeFormatter.ofPattern("M 月 d 日")) }.getOrDefault(summary.date), fontWeight = FontWeight.SemiBold)
+                            Text(summary.content, color = Color.Gray)
+                        }
+                    }
                 }
             }
         }

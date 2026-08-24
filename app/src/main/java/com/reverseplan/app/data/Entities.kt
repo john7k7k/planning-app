@@ -30,6 +30,16 @@ data class ScheduleSettingsEntity(
     val exampleSchedulesInitialized: Boolean = false
 )
 
+@Entity(tableName = "daily_summaries", indices = [Index(value = ["scheduleId", "date"], unique = true)])
+data class DailySummaryEntity(
+    @PrimaryKey val id: String = UUID.randomUUID().toString(),
+    val scheduleId: String,
+    /** ISO-8601 date, YYYY-MM-DD. */
+    val date: String,
+    val content: String,
+    val updatedAt: Long = System.currentTimeMillis()
+)
+
 @Entity(tableName = "schedule_puzzles", indices = [Index(value = ["scheduleId"])])
 data class SchedulePuzzleEntity(
     @PrimaryKey val id: String = UUID.randomUUID().toString(),

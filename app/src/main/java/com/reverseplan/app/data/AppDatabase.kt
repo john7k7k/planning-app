@@ -29,7 +29,7 @@ class AppConverters {
     @TypeConverter fun toPuzzleType(value: String) = runCatching { PuzzleType.valueOf(value) }.getOrDefault(PuzzleType.SINGLE_DAY)
 }
 
-@Database(entities = [ScheduleEntity::class, ScheduleSettingsEntity::class, SchedulePuzzleEntity::class, TaskEntity::class, TaskInstanceEntity::class, TaskCategoryEntity::class, TaskPrerequisiteEntity::class, ShopItemEntity::class, ShopItemPrerequisiteEntity::class, WalletEntity::class, TransactionEntity::class, ShopExchangeEntity::class], version = 15, exportSchema = true)
+@Database(entities = [ScheduleEntity::class, ScheduleSettingsEntity::class, SchedulePuzzleEntity::class, DailySummaryEntity::class, TaskEntity::class, TaskInstanceEntity::class, TaskCategoryEntity::class, TaskPrerequisiteEntity::class, ShopItemEntity::class, ShopItemPrerequisiteEntity::class, WalletEntity::class, TransactionEntity::class, ShopExchangeEntity::class], version = 16, exportSchema = true)
 @TypeConverters(AppConverters::class)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun taskDao(): TaskDao
@@ -137,6 +137,12 @@ abstract class AppDatabase : RoomDatabase() {
                 db.execSQL("ALTER TABLE shop_items ADD COLUMN sortOrder INTEGER NOT NULL DEFAULT 0")
             }
         }
-        fun create(context: Context) = Room.databaseBuilder(context, AppDatabase::class.java, "mission_market.db").addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12, MIGRATION_12_13, MIGRATION_13_14, MIGRATION_14_15).build()
+        private val MIGRATION_15_16 = object : Migration(15, 16) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("CREATE TABLE IF NOT EXISTS daily_summaries (id TEXT NOT NULL, scheduleId TEXT NOT NULL, date TEXT NOT NULL, content TEXT NOT NULL, updatedAt INTEGER NOT NULL, PRIMARY KEY(id))")
+                db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS index_daily_summaries_scheduleId_date ON daily_summaries(scheduleId, date)")
+            }
+        }
+        fun create(context: Context) = Room.databaseBuilder(context, AppDatabase::class.java, "mission_market.db").addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12, MIGRATION_12_13, MIGRATION_13_14, MIGRATION_14_15, MIGRATION_15_16).build()
     }
 }

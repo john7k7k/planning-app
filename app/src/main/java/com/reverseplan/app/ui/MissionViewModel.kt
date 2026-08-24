@@ -27,6 +27,7 @@ data class MissionUiState(
     val categories: List<TaskCategoryEntity> = emptyList(),
     val schedules: List<ScheduleEntity> = emptyList(),
     val puzzles: List<SchedulePuzzleEntity> = emptyList(),
+    val dailySummaries: List<DailySummaryEntity> = emptyList(),
     val shop: List<ShopCardModel> = emptyList(),
     val transactions: List<TransactionEntity> = emptyList(),
     val error: String? = null,
@@ -58,6 +59,7 @@ class MissionViewModel(private val repo: MissionRepository) : ViewModel() {
         viewModelScope.launch { activeScheduleId.flatMapLatest { repo.tasks(it) }.collect { tasks -> _state.update { it.copy(tasks = tasks) } } }
         viewModelScope.launch { activeScheduleId.flatMapLatest { repo.categories(it) }.collect { categories -> _state.update { it.copy(categories = categories) } } }
         viewModelScope.launch { repo.puzzles().collect { puzzles -> _state.update { it.copy(puzzles = puzzles) } } }
+        viewModelScope.launch { activeScheduleId.flatMapLatest { repo.dailySummaries(it) }.collect { summaries -> _state.update { it.copy(dailySummaries = summaries) } } }
         viewModelScope.launch { activeScheduleId.flatMapLatest { repo.transactions(it) }.collect { transactions -> _state.update { it.copy(transactions = transactions) } } }
         viewModelScope.launch { repo.schedules().collect { schedules -> _state.update { it.copy(schedules = schedules) } } }
         refresh()
@@ -181,6 +183,8 @@ class MissionViewModel(private val repo: MissionRepository) : ViewModel() {
     fun undoSettlement(instanceId: String, onSuccess: () -> Unit = {}, onFailure: (String) -> Unit = {}) = viewModelScope.launch {
         repo.undoSettlement(instanceId).onSuccess { (coins, diamonds) -> say("已撤回完成，歸還 🪙 $coins　💎 $diamonds"); refresh(); loadMonth(_state.value.selectedMonth); onSuccess() }.onFailure { onFailure(it.message ?: "撤回失敗") }
     }
+    fun updateSettledResult(instanceId: String, result: String) = viewModelScope.launch { runCatching { repo.updateSettledResult(instanceId, result) }.onSuccess { say("任務心得已儲存"); refresh() }.onFailure(::fail) }
+    fun saveDailySummary(date: LocalDate, content: String) = viewModelScope.launch { runCatching { repo.saveDailySummary(activeScheduleId.value, date, content) }.onSuccess { say(if (content.isBlank()) "當日總結已清除" else "當日總結已儲存") }.onFailure(::fail) }
     fun validateTime(date: String, start: String, end: String, taskId: String?, instanceId: String?) = viewModelScope.launch { _state.update { it.copy(timeConflicts = repo.timeConflicts(activeScheduleId.value, date, start, end, taskId, instanceId)) } }
     fun settle(instanceId: String, progress: BigDecimal, result: String, checkedItems: Set<Int>) = viewModelScope.launch { repo.settle(instanceId, progress, result, checkedItems).onSuccess { (coins, diamonds) -> say("結算完成：🪙 $coins　💎 $diamonds"); refresh(); loadMonth(_state.value.selectedMonth) }.onFailure(::fail) }
 

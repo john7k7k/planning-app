@@ -64,6 +64,7 @@ class MissionRepository(private val db: AppDatabase) {
     fun schedules(): Flow<List<ScheduleEntity>> = scheduleDao.observeSchedules()
     fun activeSchedule(): Flow<ScheduleSettingsEntity?> = scheduleDao.observeSettings()
     fun puzzles(): Flow<List<SchedulePuzzleEntity>> = scheduleDao.observePuzzles()
+    fun dailySummaries(scheduleId: String): Flow<List<DailySummaryEntity>> = scheduleDao.observeDailySummaries(scheduleId)
     fun items(scheduleId: String): Flow<List<ShopItemEntity>> = shopDao.observeItems(scheduleId)
     fun transactions(scheduleId: String): Flow<List<TransactionEntity>> = walletDao.observeTransactions(scheduleId)
 
@@ -125,6 +126,7 @@ class MissionRepository(private val db: AppDatabase) {
         shopDao.deleteItemsForSchedule(id)
         walletDao.deleteTransactionsForSchedule(id)
         scheduleDao.deletePuzzlesForSchedule(id)
+        scheduleDao.deleteDailySummariesForSchedule(id)
         scheduleDao.delete(schedule)
     }
 
@@ -509,8 +511,24 @@ class MissionRepository(private val db: AppDatabase) {
 
     suspend fun updateInstanceContent(instanceId: String, name: String, description: String, location: String, address: String, allDay: Boolean, start: String, end: String, coins: BigDecimal, diamonds: BigDecimal, categoryId: String, priority: TaskPriority, checklist: String) = db.withTransaction {
         val instance = taskDao.instanceById(instanceId) ?: error("找不到任務實例")
+        check(!instance.settled) { "已完成任務請先撤回，才能修改任務資訊" }
         if (!allDay && start.isNotBlank() && end.isNotBlank()) require(parseEndTime(end).isAfter(LocalTime.parse(start))) { "結束時間必須晚於開始時間" }
         taskDao.updateInstance(instance.copy(nameOverride = name, descriptionOverride = description, locationOverride = location, addressOverride = address, allDayOverride = allDay, startTimeOverride = if (allDay) "" else start, endTimeOverride = if (allDay) "" else end, rewardCoinsOverride = coins, rewardDiamondsOverride = diamonds, categoryIdOverride = categoryId, priorityOverride = priority, checklistOverride = checklist))
+    }
+
+    suspend fun updateSettledResult(instanceId: String, result: String) = db.withTransaction {
+        val instance = taskDao.instanceById(instanceId) ?: error("找不到任務實例")
+        check(instance.settled) { "任務尚未完成" }
+        taskDao.updateInstance(instance.copy(result = result))
+    }
+
+    suspend fun saveDailySummary(scheduleId: String, date: LocalDate, content: String) = db.withTransaction {
+        val text = content.trim()
+        if (text.isBlank()) scheduleDao.deleteDailySummary(scheduleId, date.toString())
+        else {
+            val existing = scheduleDao.dailySummary(scheduleId, date.toString())
+            scheduleDao.upsertDailySummary(DailySummaryEntity(id = existing?.id ?: UUID.randomUUID().toString(), scheduleId = scheduleId, date = date.toString(), content = text))
+        }
     }
 
     suspend fun deleteInstance(instanceId: String) = db.withTransaction {
