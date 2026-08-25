@@ -193,7 +193,7 @@ private fun Dashboard(state: MissionUiState, vm: MissionViewModel, chooseDate: (
     var editing by remember { mutableStateOf<TaskCardModel?>(null) }
     var reviewing by remember { mutableStateOf<TaskCardModel?>(null) }
     var editingReward by remember { mutableStateOf<RewardSchedule?>(null) }
-    var quickAdd by remember { mutableStateOf(false) }
+    var quickAddInitial by remember { mutableStateOf<TaskEntity?>(null) }
     var viewingCompleted by remember { mutableStateOf(false) }
     var scrollToEntryKey by remember { mutableStateOf<String?>(null) }
     var currentTime by remember { mutableStateOf(LocalTime.now()) }
@@ -270,23 +270,24 @@ private fun Dashboard(state: MissionUiState, vm: MissionViewModel, chooseDate: (
                 val cards = data?.cards.orEmpty()
                 val urgentCards = cards.filter { !it.instance.settled && it.task.priority == TaskPriority.RED }
                 Card(modifier = Modifier.fillMaxWidth().padding(top = 12.dp, start = 16.dp, end = 16.dp).clickable(enabled = progressPreviewCards.isNotEmpty()) { viewingCompleted = true }) {
-                    Row(Modifier.fillMaxWidth().padding(16.dp), horizontalArrangement = Arrangement.SpaceBetween) {
-                        Column(Modifier.weight(1f)) {
-                            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.fillMaxWidth().padding(16.dp)) {
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
                                 Text(if (state.selectedDate == LocalDate.now()) "今天進度" else "當日進度", fontWeight = FontWeight.Bold)
                                 if (state.selectedDate == LocalDate.now() && urgentCards.isNotEmpty()) {
                                     Text(
-                                        "　⚠ ${urgentCards.size} 項重要未完成",
+                                        "　${urgentCards.size} 項重要未完成",
                                         color = Color(0xFFD92D20),
                                         style = MaterialTheme.typography.labelMedium,
                                         maxLines = 1
                                     )
                                 }
                             }
-                            Text("${cards.count { it.instance.settled }} / ${cards.size} 項已結算", color = Color.Gray)
-                        }
-                        Column(Modifier.padding(start = 8.dp), horizontalAlignment = Alignment.End) {
                             Text("本日獲得", style = MaterialTheme.typography.labelSmall)
+                        }
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            Text("${cards.count { it.instance.settled }} / ${cards.size} 項已結算", color = Color.Gray)
+                            Spacer(Modifier.weight(1f))
                             Text("🪙 ${data?.earnedCoins ?: 0}　💎 ${data?.earnedDiamonds ?: 0}", color = Violet, maxLines = 1, softWrap = false)
                         }
                     }
@@ -318,7 +319,7 @@ private fun Dashboard(state: MissionUiState, vm: MissionViewModel, chooseDate: (
             item { Spacer(Modifier.height(92.dp)) }
         }
         if (!state.isDateLoading) ExtendedFloatingActionButton(
-            onClick = { quickAdd = true },
+            onClick = { quickAddInitial = TaskEntity(name = "", startDate = state.selectedDate.toString(), timelineOnly = true) },
             icon = { Icon(Icons.Default.Add, "加入單次任務") },
             text = { Text("加入單次任務") },
             modifier = Modifier.align(Alignment.BottomEnd).padding(20.dp)
@@ -370,16 +371,16 @@ private fun Dashboard(state: MissionUiState, vm: MissionViewModel, chooseDate: (
             { vm.deleteRewardInstance(reward.exchange.id); editingReward = null }
         )
     }
-    if (quickAdd) {
+    quickAddInitial?.let { initial ->
         TaskFormDialog(
             title = "加入時間軸單次任務",
-            initial = TaskEntity(name = "", startDate = state.selectedDate.toString(), timelineOnly = true),
+            initial = initial,
             categories = state.categories,
             allowRepeat = false,
-            dismiss = { quickAdd = false },
+            dismiss = { quickAddInitial = null },
             save = { task ->
                 vm.addTimelineTask(task.copy(timelineOnly = true, repeatType = RepeatType.NONE))
-                quickAdd = false
+                quickAddInitial = null
             }
         )
     }
@@ -947,7 +948,7 @@ private fun DailySummaryCard(date: LocalDate, initial: String, save: (String) ->
 
 @Composable
 private fun TaskLibrary(state: MissionUiState, vm: MissionViewModel) {
-    var creating by remember { mutableStateOf(false) }
+    var creatingInitial by remember { mutableStateOf<TaskEntity?>(null) }
     var editing by remember { mutableStateOf<TaskEntity?>(null) }
     var categoryManager by remember { mutableStateOf(false) }
     Box(Modifier.fillMaxSize()) {
@@ -978,16 +979,16 @@ private fun TaskLibrary(state: MissionUiState, vm: MissionViewModel) {
             }
             item { Spacer(Modifier.height(88.dp)) }
         }
-        FloatingActionButton({ creating = true }, Modifier.align(Alignment.BottomEnd).padding(22.dp)) { Icon(Icons.Default.Add, "新增任務") }
+        FloatingActionButton({ creatingInitial = TaskEntity(name = "", startDate = LocalDate.now().toString()) }, Modifier.align(Alignment.BottomEnd).padding(22.dp)) { Icon(Icons.Default.Add, "新增任務") }
     }
-    if (creating) {
+    creatingInitial?.let { initial ->
         TaskFormDialog(
             title = "新增任務",
-            initial = TaskEntity(name = "", startDate = LocalDate.now().toString()),
+            initial = initial,
             categories = state.categories,
             allowRepeat = true,
-            dismiss = { creating = false },
-            save = { task -> vm.saveTask(task); creating = false }
+            dismiss = { creatingInitial = null },
+            save = { task -> vm.saveTask(task); creatingInitial = null }
         )
     }
     editing?.let { task ->
