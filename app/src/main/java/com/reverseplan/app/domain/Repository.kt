@@ -620,7 +620,17 @@ class MissionRepository(private val db: AppDatabase) {
         check(old.coins >= instance.earnedCoins && old.diamonds >= instance.earnedDiamonds) { "錢包餘額不足，無法歸還本次任務獎勵" }
         val updated = old.copy(coins = old.coins - instance.earnedCoins, diamonds = old.diamonds - instance.earnedDiamonds, updatedAt = System.currentTimeMillis())
         val coins = instance.earnedCoins; val diamonds = instance.earnedDiamonds
-        taskDao.updateInstance(instance.copy(status = if (instance.completionPercentage > BigDecimal.ZERO) TaskStatus.IN_PROGRESS else TaskStatus.NOT_STARTED, settled = false, earnedCoins = BigDecimal.ZERO, earnedDiamonds = BigDecimal.ZERO, settledAt = null))
+        taskDao.updateInstance(
+            instance.copy(
+                completionPercentage = BigDecimal.ZERO,
+                checkedChecklistItems = "",
+                status = TaskStatus.NOT_STARTED,
+                settled = false,
+                earnedCoins = BigDecimal.ZERO,
+                earnedDiamonds = BigDecimal.ZERO,
+                settledAt = null
+            )
+        )
         walletDao.save(updated)
         walletDao.transaction(TransactionEntity(type = TransactionType.MANUAL_ADJUSTMENT, coinChange = coins.negate(), diamondChange = diamonds.negate(), coinsBefore = old.coins, coinsAfter = updated.coins, diamondsBefore = old.diamonds, diamondsAfter = updated.diamonds, relatedTaskInstanceId = instance.id, scheduleId = (taskDao.task(instance.taskId)?.scheduleId ?: DEFAULT_SCHEDULE_ID), note = "撤回任務完成，歸還獎勵"))
         coins to diamonds

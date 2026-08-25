@@ -1,6 +1,9 @@
 package com.reverseplan.app
 
 import android.os.Bundle
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -33,6 +36,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.core.content.ContextCompat
 import com.reverseplan.app.data.*
 import com.reverseplan.app.domain.*
 import com.reverseplan.app.ui.MissionUiState
@@ -57,9 +61,14 @@ private val Gold = Color(0xFFFFC145)
 private val Diamond = Color(0xFF4CC9F0)
 private val SoftBackground = Color(0xFFF7F7FC)
 
+private fun completionText(value: BigDecimal): String = value
+    .setScale(2, RoundingMode.HALF_UP)
+    .stripTrailingZeros()
+    .toPlainString()
+
 class MainActivity : ComponentActivity() {
     private val vm: MissionViewModel by viewModels {
-        MissionViewModelFactory((application as MissionApp).repository)
+        (application as MissionApp).let { MissionViewModelFactory(it.repository, it.taskNotificationScheduler) }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -72,8 +81,15 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun MissionAppUi(vm: MissionViewModel) {
     val state by vm.state.collectAsStateWithLifecycle()
+    val context = LocalContext.current
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
     var tab by rememberSaveable { mutableIntStateOf(0) }
     var showDatePicker by rememberSaveable { mutableStateOf(false) }
+    LaunchedEffect(Unit) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+    }
     val tabs = listOf(
         "首頁" to Icons.Default.Home,
         "任務庫" to Icons.Default.Checklist,
@@ -190,6 +206,14 @@ private fun Dashboard(state: MissionUiState, vm: MissionViewModel, chooseDate: (
         }
     }
     val data = if (state.isDateLoading) null else state.dashboard
+    val progressPreviewCards = data?.cards.orEmpty()
+        .filter { card ->
+            card.instance.settled || (
+                state.selectedDate == LocalDate.now() &&
+                    !card.instance.settled && card.task.priority == TaskPriority.RED
+                )
+        }
+        .sortedBy { (it.instance.startTimeOverride ?: it.task.startTime).ifBlank { "99:99" } }
     val entries = remember(data, state.selectedDate, currentTime) {
         val isToday = state.selectedDate == LocalDate.now()
         val scheduledEntries = data?.cards.orEmpty().map(::TaskEntry) + data?.rewards.orEmpty().map(::RewardEntry)
@@ -244,21 +268,32 @@ private fun Dashboard(state: MissionUiState, vm: MissionViewModel, chooseDate: (
                 Box(Modifier.padding(top = 12.dp, start = 16.dp, end = 16.dp)) { DateLoadingCard() }
             } else item {
                 val cards = data?.cards.orEmpty()
-                Card(modifier = Modifier.fillMaxWidth().padding(top = 12.dp, start = 16.dp, end = 16.dp).clickable(enabled = cards.any { it.instance.settled }) { viewingCompleted = true }) {
+                val urgentCards = cards.filter { !it.instance.settled && it.task.priority == TaskPriority.RED }
+                Card(modifier = Modifier.fillMaxWidth().padding(top = 12.dp, start = 16.dp, end = 16.dp).clickable(enabled = progressPreviewCards.isNotEmpty()) { viewingCompleted = true }) {
                     Row(Modifier.fillMaxWidth().padding(16.dp), horizontalArrangement = Arrangement.SpaceBetween) {
-                        Column {
-                            Text(if (state.selectedDate == LocalDate.now()) "今天進度" else "當日進度", fontWeight = FontWeight.Bold)
+                        Column(Modifier.weight(1f)) {
+                            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                                Text(if (state.selectedDate == LocalDate.now()) "今天進度" else "當日進度", fontWeight = FontWeight.Bold)
+                                if (state.selectedDate == LocalDate.now() && urgentCards.isNotEmpty()) {
+                                    Text(
+                                        "　⚠ ${urgentCards.size} 項重要未完成",
+                                        color = Color(0xFFD92D20),
+                                        style = MaterialTheme.typography.labelMedium,
+                                        maxLines = 1
+                                    )
+                                }
+                            }
                             Text("${cards.count { it.instance.settled }} / ${cards.size} 項已結算", color = Color.Gray)
                         }
-                        Column(horizontalAlignment = Alignment.End) {
+                        Column(Modifier.padding(start = 8.dp), horizontalAlignment = Alignment.End) {
                             Text("本日獲得", style = MaterialTheme.typography.labelSmall)
-                            Text("🪙 ${data?.earnedCoins ?: 0}　💎 ${data?.earnedDiamonds ?: 0}", color = Violet)
+                            Text("🪙 ${data?.earnedCoins ?: 0}　💎 ${data?.earnedDiamonds ?: 0}", color = Violet, maxLines = 1, softWrap = false)
                         }
                     }
                 }
             }
             if (!state.isDateLoading) {
-                item { Text("時間軸", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 16.dp)) }
+                item { Spacer(Modifier.height(32.dp)) }
                 if (entries.isEmpty()) item { EmptyHint("這天尚未安排任務或獎勵。") }
                 itemsIndexed(entries, key = { _, entry -> entry.key }) { _, entry ->
                     when (entry) {
@@ -290,8 +325,7 @@ private fun Dashboard(state: MissionUiState, vm: MissionViewModel, chooseDate: (
         )
     }
     if (viewingCompleted) CompletedTasksDialog(
-        cards = data?.cards.orEmpty().filter { it.instance.settled }
-            .sortedBy { (it.instance.startTimeOverride ?: it.task.startTime).ifBlank { "99:99" } },
+        cards = progressPreviewCards,
         categories = state.categories,
         dismiss = { viewingCompleted = false },
         openTask = { card ->
@@ -310,7 +344,7 @@ private fun Dashboard(state: MissionUiState, vm: MissionViewModel, chooseDate: (
             card = card,
             dismiss = { reviewing = null },
             saveResult = { result -> vm.updateSettledResult(card.instance.id, result) },
-            undo = { error -> vm.undoSettlement(card.instance.id, onSuccess = { reviewing = null; editing = card }, onFailure = error) }
+            undo = { error -> vm.undoSettlement(card.instance.id, onSuccess = { reviewing = null }, onFailure = error) }
         )
     }
     editing?.let { card ->
@@ -353,38 +387,52 @@ private fun Dashboard(state: MissionUiState, vm: MissionViewModel, chooseDate: (
 
 @Composable
 private fun CompletedTasksDialog(cards: List<TaskCardModel>, categories: List<TaskCategoryEntity>, dismiss: () -> Unit, openTask: (TaskCardModel) -> Unit) {
+    val urgentCards = cards.filter { !it.instance.settled && it.task.priority == TaskPriority.RED }
+    val settledCards = cards.filter { it.instance.settled }
     AlertDialog(
         onDismissRequest = dismiss,
-        title = { Text("已完成任務") },
+        title = { Text("今天進度") },
         text = {
             if (cards.isEmpty()) Text("這天尚未有已結算的任務。", color = Color.Gray)
             else LazyColumn(Modifier.heightIn(max = 360.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                items(cards, key = { it.instance.id }) { card ->
-                    val category = categories.firstOrNull { it.id == card.task.categoryId }
-                    Card(
-                        colors = CardDefaults.cardColors(containerColor = Color(0xFFEAF8ED)),
-                        modifier = Modifier.fillMaxWidth().clickable { openTask(card) }
-                    ) {
-                        Column(Modifier.padding(12.dp)) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text(category?.icon ?: "📌", style = MaterialTheme.typography.titleMedium)
-                                Column(Modifier.padding(start = 8.dp).weight(1f)) {
-                                    Text(card.task.name, fontWeight = FontWeight.Bold)
-                                    Text(category?.name ?: "其他", color = Color.Gray, style = MaterialTheme.typography.labelSmall)
-                                }
-                                Text(listOf(card.task.startTime, card.task.endTime).filter { it.isNotBlank() }.joinToString(" ～ ").ifBlank { "全天" }, color = Violet, style = MaterialTheme.typography.labelSmall)
-                            }
-                            Text("完成度 ${card.instance.completionPercentage}%", color = Color.Gray, style = MaterialTheme.typography.labelSmall)
-                            card.instance.result.takeIf { it.isNotBlank() }?.let { result ->
-                                Text(result, color = Color.Gray, maxLines = 1, modifier = Modifier.padding(top = 4.dp))
-                            }
-                        }
-                    }
+                if (urgentCards.isNotEmpty()) {
+                    item { Text("未完成的重要任務", color = Color(0xFFD92D20), fontWeight = FontWeight.Bold) }
+                    items(urgentCards, key = { it.instance.id }) { card -> ProgressPreviewCard(card, categories, openTask) }
+                }
+                if (settledCards.isNotEmpty()) {
+                    item { Text("已完成任務", fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = if (urgentCards.isEmpty()) 0.dp else 8.dp)) }
+                    items(settledCards, key = { it.instance.id }) { card -> ProgressPreviewCard(card, categories, openTask) }
                 }
             }
         },
         confirmButton = { TextButton(dismiss) { Text("關閉") } }
     )
+}
+
+@Composable
+private fun ProgressPreviewCard(card: TaskCardModel, categories: List<TaskCategoryEntity>, openTask: (TaskCardModel) -> Unit) {
+    val isUrgent = !card.instance.settled && card.task.priority == TaskPriority.RED
+    val category = categories.firstOrNull { it.id == card.task.categoryId }
+    Card(
+        colors = CardDefaults.cardColors(containerColor = if (isUrgent) Color(0xFFFFEBEE) else Color(0xFFEAF8ED)),
+        modifier = Modifier.fillMaxWidth().clickable { openTask(card) }
+    ) {
+        Column(Modifier.padding(12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(category?.icon ?: "📌", style = MaterialTheme.typography.titleMedium)
+                Column(Modifier.padding(start = 8.dp).weight(1f)) {
+                    Text(card.task.name, fontWeight = FontWeight.Bold)
+                    Text(category?.name ?: "其他", color = Color.Gray, style = MaterialTheme.typography.labelSmall)
+                }
+                Text(listOf(card.task.startTime, card.task.endTime).filter { it.isNotBlank() }.joinToString(" ～ ").ifBlank { "全天" }, color = Violet, style = MaterialTheme.typography.labelSmall)
+            }
+            if (isUrgent) Text("⚠ 重要任務未完成", color = Color(0xFFD92D20), style = MaterialTheme.typography.labelSmall)
+            Text("完成度 ${completionText(card.instance.completionPercentage)}%", color = Color.Gray, style = MaterialTheme.typography.labelSmall)
+            card.instance.result.takeIf { it.isNotBlank() }?.let { result ->
+                Text(result, color = Color.Gray, maxLines = 1, modifier = Modifier.padding(top = 4.dp))
+            }
+        }
+    }
 }
 
 @Composable
@@ -497,13 +545,20 @@ private fun IntermediateCurrentScheduleCard(data: DashboardData?, now: LocalTime
 private fun CurrentScheduleCard(data: DashboardData?, now: LocalTime, openTask: (TaskCardModel) -> Unit) {
     val task = data?.cards?.firstOrNull { inRange(it.task.startTime, it.task.endTime, now) }
     val reward = data?.rewards?.firstOrNull { rewardInRange(it, now) }
+    val nextTask = data?.cards.orEmpty()
+        .filter { card ->
+            !card.instance.settled && card.task.startTime.isNotBlank() &&
+                runCatching { LocalTime.parse(card.task.startTime).isAfter(now) }.getOrDefault(false)
+        }
+        .minByOrNull { it.task.startTime }
+    val taskToOpen = task ?: nextTask?.takeIf { reward == null }
     Card(
         colors = CardDefaults.cardColors(containerColor = Ink),
         shape = RoundedCornerShape(24.dp),
-        modifier = Modifier.fillMaxWidth().clickable(enabled = task != null) { task?.let(openTask) }
+        modifier = Modifier.fillMaxWidth().clickable(enabled = taskToOpen != null) { taskToOpen?.let(openTask) }
     ) {
         Column(Modifier.padding(20.dp)) {
-            Text("現在進行中", color = Color.White.copy(alpha = .7f))
+            Text(if (task == null && reward == null && nextTask != null) "下一個任務" else "現在進行中", color = Color.White.copy(alpha = .7f))
             when {
                 task != null -> {
                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -515,6 +570,12 @@ private fun CurrentScheduleCard(data: DashboardData?, now: LocalTime, openTask: 
                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                         Text("${reward.item.emoji} ${reward.item.name}", color = Color.White, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, maxLines = 1, modifier = Modifier.weight(1f))
                         Text("獎勵行程", color = Gold, style = MaterialTheme.typography.labelLarge)
+                    }
+                }
+                nextTask != null -> {
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Text("📌 ${nextTask.task.name}", color = Color.White, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, maxLines = 1, modifier = Modifier.weight(1f))
+                        Text("${nextTask.task.startTime} ～ ${nextTask.task.endTime}", color = Gold, style = MaterialTheme.typography.labelLarge)
                     }
                 }
                 else -> Text("目前沒有進行中的任務或獎勵。", color = Color.White, style = MaterialTheme.typography.titleMedium)
@@ -546,9 +607,17 @@ private fun timelineProgress(start: String, end: String, now: LocalTime): Float?
 private fun CurrentTimeTimelineMarker(time: String) {
     val red = Color(0xFFD92D20)
     Box(Modifier.fillMaxWidth().height(28.dp), contentAlignment = Alignment.CenterStart) {
-        Box(Modifier.fillMaxWidth().height(2.dp).background(red))
-        Text(time, color = red, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelSmall, modifier = Modifier.padding(start = 8.dp).background(SoftBackground))
-        Surface(color = red, shape = RoundedCornerShape(20.dp), modifier = Modifier.padding(start = 68.dp).size(12.dp)) {}
+        // Keep the timeline continuous above and below the current-time marker.
+        Box(Modifier.padding(start = 74.dp).width(2.dp).fillMaxHeight().background(Violet.copy(alpha = .38f)))
+        Box(Modifier.fillMaxWidth().height(2.dp).background(red).zIndex(-1f))
+        Text(
+            time,
+            color = red,
+            fontWeight = FontWeight.Bold,
+            style = MaterialTheme.typography.labelSmall,
+            modifier = Modifier.padding(start = 8.dp).background(SoftBackground).zIndex(1f)
+        )
+        Surface(color = red, shape = RoundedCornerShape(20.dp), modifier = Modifier.padding(start = 69.dp).size(12.dp).zIndex(1f)) {}
     }
 }
 
@@ -749,7 +818,7 @@ private fun TaskCard(card: TaskCardModel, category: TaskCategoryEntity?, onSettl
                 modifier = Modifier.fillMaxWidth().padding(top = 10.dp)
             )
             Text(
-                "完成度 ${card.instance.completionPercentage.stripTrailingZeros().toPlainString()}%　🪙 ${task.rewardCoins}　💎 ${task.rewardDiamonds}",
+                "完成度 ${completionText(card.instance.completionPercentage)}%　🪙 ${task.rewardCoins}　💎 ${task.rewardDiamonds}",
                 style = MaterialTheme.typography.labelMedium
             )
             if (!card.unlocked) {
@@ -837,7 +906,7 @@ private fun TaskReviewDialog(card: TaskCardModel, dismiss: () -> Unit, saveResul
             Text("${card.instance.scheduledDate} · ${card.task.startTime.ifBlank { "全天" }}${card.task.endTime.takeIf { it.isNotBlank() }?.let { " – $it" }.orEmpty()}", color = Color.Gray)
             card.task.description.takeIf { it.isNotBlank() }?.let { Text(it) }
             card.task.locationName.takeIf { it.isNotBlank() }?.let { Text("地點：$it", color = Color.Gray) }
-            Text("完成度 ${card.instance.completionPercentage.stripTrailingZeros().toPlainString()}% · 已獲得 🪙 ${card.instance.earnedCoins}　💎 ${card.instance.earnedDiamonds}", style = MaterialTheme.typography.bodySmall)
+            Text("完成度 ${completionText(card.instance.completionPercentage)}% · 已獲得 🪙 ${card.instance.earnedCoins}　💎 ${card.instance.earnedDiamonds}", style = MaterialTheme.typography.bodySmall)
             HorizontalDivider()
             Field("任務結果／心得", result) { result = it }
             Text("任務資訊如名稱、時間、獎勵等，需先撤回完成後才能編輯。", color = Color.Gray, style = MaterialTheme.typography.labelSmall)

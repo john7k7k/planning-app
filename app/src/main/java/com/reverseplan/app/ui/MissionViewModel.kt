@@ -3,6 +3,7 @@ package com.reverseplan.app.ui
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import com.reverseplan.app.TaskNotificationScheduler
 import com.reverseplan.app.data.*
 import com.reverseplan.app.domain.*
 import kotlinx.coroutines.Job
@@ -36,7 +37,10 @@ data class MissionUiState(
     val isDateLoading: Boolean = false
 )
 
-class MissionViewModel(private val repo: MissionRepository) : ViewModel() {
+class MissionViewModel(
+    private val repo: MissionRepository,
+    private val taskNotificationScheduler: TaskNotificationScheduler
+) : ViewModel() {
     private val _state = MutableStateFlow(MissionUiState())
     val state: StateFlow<MissionUiState> = _state.asStateFlow()
     private val activeScheduleId = MutableStateFlow(MissionRepository.DEFAULT_SCHEDULE_ID)
@@ -92,7 +96,9 @@ class MissionViewModel(private val repo: MissionRepository) : ViewModel() {
             .onSuccess { (dashboard, shop) -> _state.update { current ->
                 if (current.selectedDate != date || current.activeScheduleId != scheduleId) current
                 else current.copy(dashboard = dashboard, shop = shop, currentDashboard = if (date == LocalDate.now()) dashboard else current.currentDashboard, error = null, isDateLoading = false)
-            } }
+                }
+                rescheduleTaskNotifications(scheduleId)
+            }
             .onFailure { error ->
                 _state.update { current -> if (current.selectedDate == date && current.activeScheduleId == scheduleId) current.copy(isDateLoading = false, error = error.message ?: "發生未知錯誤") else current }
             }
@@ -135,6 +141,10 @@ class MissionViewModel(private val repo: MissionRepository) : ViewModel() {
     }
 
     private fun cacheKey(scheduleId: String, date: LocalDate) = "$scheduleId|$date"
+
+    private fun rescheduleTaskNotifications(scheduleId: String = activeScheduleId.value) = viewModelScope.launch {
+        runCatching { taskNotificationScheduler.scheduleUpcoming(scheduleId) }
+    }
 
     fun selectSchedule(id: String) = viewModelScope.launch { runCatching { repo.selectSchedule(id) }.onSuccess { say("已切換行程") }.onFailure(::fail) }
     fun createSchedule(name: String) = viewModelScope.launch { runCatching { repo.createSchedule(name) }.onSuccess { say("行程已新增") }.onFailure(::fail) }
@@ -212,6 +222,9 @@ class MissionViewModel(private val repo: MissionRepository) : ViewModel() {
     private fun fail(error: Throwable) = _state.update { it.copy(error = error.message ?: "發生未知錯誤") }
 }
 
-class MissionViewModelFactory(private val repo: MissionRepository) : ViewModelProvider.Factory {
-    @Suppress("UNCHECKED_CAST") override fun <T : ViewModel> create(modelClass: Class<T>): T = MissionViewModel(repo) as T
+class MissionViewModelFactory(
+    private val repo: MissionRepository,
+    private val taskNotificationScheduler: TaskNotificationScheduler
+) : ViewModelProvider.Factory {
+    @Suppress("UNCHECKED_CAST") override fun <T : ViewModel> create(modelClass: Class<T>): T = MissionViewModel(repo, taskNotificationScheduler) as T
 }
