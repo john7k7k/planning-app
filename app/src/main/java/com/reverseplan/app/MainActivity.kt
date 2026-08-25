@@ -734,8 +734,13 @@ private fun TaskCard(card: TaskCardModel, category: TaskCategoryEntity?, onSettl
             }
             val previewText = if (card.instance.settled) card.instance.result else task.description
             if (previewText.isNotBlank()) {
-                Text(previewText, color = Color.Gray, style = MaterialTheme.typography.bodyMedium, maxLines = 1, modifier = Modifier.padding(top = 8.dp))
-                if (previewText.length > 28) TextButton({ detail = true }) { Text("查看詳細") }
+                Text(
+                    previewText,
+                    color = Color.Gray,
+                    style = MaterialTheme.typography.bodyMedium,
+                    maxLines = 1,
+                    modifier = Modifier.padding(top = 8.dp).clickable { detail = true }
+                )
             } else if (card.instance.settled) {
                 Text("尚未填寫完成心得。", color = Color.Gray, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 8.dp))
             }
