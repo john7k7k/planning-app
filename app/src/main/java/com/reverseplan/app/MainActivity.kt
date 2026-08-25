@@ -516,7 +516,7 @@ private fun TaskReviewDialog(card: TaskCardModel, dismiss: () -> Unit, saveResul
             Text("任務資訊如名稱、時間、獎勵等，需先撤回完成後才能編輯。", color = Color.Gray, style = MaterialTheme.typography.labelSmall)
             undoError?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
         } },
-        confirmButton = { Button({ saveResult(result) }) { Text("儲存心得") } },
+        confirmButton = { Button({ saveResult(result); dismiss() }) { Text("儲存心得") } },
         dismissButton = { Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             TextButton({ undoError = null; undo { undoError = it } }, colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)) { Text("撤回") }
             TextButton(dismiss) { Text("關閉") }
