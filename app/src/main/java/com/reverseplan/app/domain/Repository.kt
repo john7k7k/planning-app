@@ -130,24 +130,44 @@ class MissionRepository(private val db: AppDatabase) {
         scheduleDao.delete(schedule)
     }
 
-    suspend fun exportSchedule(scheduleId: String): String {
+    suspend fun exportSchedule(scheduleId: String, includeCompletionData: Boolean = false): String {
         val schedule = scheduleDao.schedule(scheduleId) ?: error("找不到行程")
+        val exportedTasks = taskDao.tasksForSchedule(scheduleId)
+            .filter { includeCompletionData || !it.timelineOnly }
         return JSONObject().apply {
             put("format", "mission-market-schedule-v1")
             put("name", schedule.name)
             put("exportedAt", System.currentTimeMillis())
+            put("includesCompletionData", includeCompletionData)
             put("categories", JSONArray(categoryDao.categories(scheduleId).map { category -> JSONObject().apply { put("id", category.id); put("name", category.name); put("icon", category.icon) } }))
-            put("tasks", JSONArray(taskDao.tasksForSchedule(scheduleId).filterNot { it.timelineOnly }.map { task -> JSONObject().apply {
+            put("tasks", JSONArray(exportedTasks.map { task -> JSONObject().apply {
+                put("id", task.id)
                 put("name", task.name); put("description", task.description); put("startDate", task.startDate)
                 put("startTime", task.startTime); put("endTime", task.endTime); put("allDay", task.allDay)
                 put("repeatType", task.repeatType.name); put("repeatConfig", task.repeatConfig); put("repeatEndDate", task.repeatEndDate)
                 put("categoryId", task.categoryId); put("priority", task.priority.name); put("checklist", task.checklist)
+                put("timelineOnly", task.timelineOnly)
                 put("rewardCoins", task.rewardCoins.toPlainString()); put("rewardDiamonds", task.rewardDiamonds.toPlainString())
             } }))
             put("shopItems", JSONArray(shopDao.allItems(scheduleId).map { item -> JSONObject().apply {
                 put("name", item.name); put("emoji", item.emoji); put("description", item.description)
                 put("coinPrice", item.coinPrice.toPlainString()); put("diamondPrice", item.diamondPrice.toPlainString()); put("sortOrder", item.sortOrder)
             } }))
+            if (includeCompletionData) {
+                val completedInstances = exportedTasks.flatMap { taskDao.instancesForTask(it.id) }
+                    .filter { it.settled || it.result.isNotBlank() }
+                put("completionData", JSONArray(completedInstances.map { instance -> JSONObject().apply {
+                    put("taskId", instance.taskId); put("scheduledDate", instance.scheduledDate)
+                    put("completionPercentage", instance.completionPercentage.toPlainString()); put("result", instance.result)
+                    put("status", instance.status.name); put("settled", instance.settled)
+                    put("earnedCoins", instance.earnedCoins.toPlainString()); put("earnedDiamonds", instance.earnedDiamonds.toPlainString())
+                    put("settledAt", instance.settledAt ?: JSONObject.NULL)
+                    put("checkedChecklistItems", instance.checkedChecklistItems)
+                } }))
+                put("dailySummaries", JSONArray(scheduleDao.dailySummaries(scheduleId).map { summary -> JSONObject().apply {
+                    put("date", summary.date); put("content", summary.content); put("updatedAt", summary.updatedAt)
+                } }))
+            }
         }.toString(2)
     }
 
@@ -170,24 +190,79 @@ class MissionRepository(private val db: AppDatabase) {
             }
             category.optString("id").takeIf { it.isNotBlank() }?.let { categoryMap[it] = resolvedCategory.id }
         }
+        val taskIdMap = mutableMapOf<String, String>()
         val tasks = source.optJSONArray("tasks") ?: JSONArray()
         for (i in 0 until tasks.length()) {
             val task = tasks.getJSONObject(i)
             val categoryId = categoryMap[task.optString("categoryId")] ?: defaultCategoryId(schedule.id, "other")
-            taskDao.upsert(TaskEntity(
+            val importedTask = TaskEntity(
                 name = task.optString("name", "未命名任務"), description = task.optString("description"),
                 startDate = task.optString("startDate", LocalDate.now().toString()), startTime = task.optString("startTime"), endTime = task.optString("endTime"),
                 allDay = task.optBoolean("allDay", true), repeatType = runCatching { RepeatType.valueOf(task.optString("repeatType", "NONE")) }.getOrDefault(RepeatType.NONE),
                 repeatConfig = task.optString("repeatConfig"), repeatEndDate = task.optString("repeatEndDate"), categoryId = categoryId,
                 priority = runCatching { TaskPriority.valueOf(task.optString("priority", "NONE")) }.getOrDefault(TaskPriority.NONE), checklist = task.optString("checklist"),
+                timelineOnly = task.optBoolean("timelineOnly", false),
                 rewardCoins = task.optString("rewardCoins", "0").toBigDecimalOrNull() ?: BigDecimal.ZERO,
                 rewardDiamonds = task.optString("rewardDiamonds", "0").toBigDecimalOrNull() ?: BigDecimal.ZERO, scheduleId = schedule.id
-            ))
+            )
+            taskDao.upsert(importedTask)
+            task.optString("id").takeIf { it.isNotBlank() }?.let { taskIdMap[it] = importedTask.id }
         }
         val items = source.optJSONArray("shopItems") ?: JSONArray()
         for (i in 0 until items.length()) {
             val item = items.getJSONObject(i)
             shopDao.upsert(ShopItemEntity(name = item.optString("name", "未命名商品"), emoji = item.optString("emoji", "🎁"), description = item.optString("description"), coinPrice = item.optString("coinPrice", "0").toBigDecimalOrNull() ?: BigDecimal.ZERO, diamondPrice = item.optString("diamondPrice", "0").toBigDecimalOrNull() ?: BigDecimal.ZERO, sortOrder = item.optInt("sortOrder", 0), scheduleId = schedule.id))
+        }
+        val completionData = source.optJSONArray("completionData") ?: JSONArray()
+        for (i in 0 until completionData.length()) {
+            val completion = completionData.getJSONObject(i)
+            val taskId = taskIdMap[completion.optString("taskId")] ?: continue
+            val importedInstance = TaskInstanceEntity(
+                taskId = taskId,
+                scheduledDate = completion.optString("scheduledDate", LocalDate.now().toString()),
+                completionPercentage = completion.optString("completionPercentage", "0").toBigDecimalOrNull() ?: BigDecimal.ZERO,
+                result = completion.optString("result"),
+                status = runCatching { TaskStatus.valueOf(completion.optString("status", "NOT_STARTED")) }.getOrDefault(TaskStatus.NOT_STARTED),
+                settled = completion.optBoolean("settled", false),
+                earnedCoins = completion.optString("earnedCoins", "0").toBigDecimalOrNull() ?: BigDecimal.ZERO,
+                earnedDiamonds = completion.optString("earnedDiamonds", "0").toBigDecimalOrNull() ?: BigDecimal.ZERO,
+                settledAt = if (completion.isNull("settledAt")) null else completion.optLong("settledAt"),
+                checkedChecklistItems = completion.optString("checkedChecklistItems")
+            )
+            taskDao.insertInstance(importedInstance)
+            if (importedInstance.settled) {
+                val oldWallet = walletDao.wallet() ?: WalletEntity()
+                val updatedWallet = oldWallet.copy(
+                    coins = oldWallet.coins + importedInstance.earnedCoins,
+                    diamonds = oldWallet.diamonds + importedInstance.earnedDiamonds,
+                    updatedAt = System.currentTimeMillis()
+                )
+                walletDao.save(updatedWallet)
+                walletDao.transaction(TransactionEntity(
+                    type = TransactionType.TASK_REWARD,
+                    coinChange = importedInstance.earnedCoins,
+                    diamondChange = importedInstance.earnedDiamonds,
+                    coinsBefore = oldWallet.coins,
+                    coinsAfter = updatedWallet.coins,
+                    diamondsBefore = oldWallet.diamonds,
+                    diamondsAfter = updatedWallet.diamonds,
+                    relatedTaskInstanceId = importedInstance.id,
+                    scheduleId = schedule.id,
+                    createdAt = importedInstance.settledAt ?: System.currentTimeMillis(),
+                    note = "匯入任務完成獎勵"
+                ))
+            }
+        }
+        val dailySummaries = source.optJSONArray("dailySummaries") ?: JSONArray()
+        for (i in 0 until dailySummaries.length()) {
+            val summary = dailySummaries.getJSONObject(i)
+            val content = summary.optString("content")
+            if (content.isNotBlank()) scheduleDao.upsertDailySummary(DailySummaryEntity(
+                scheduleId = schedule.id,
+                date = summary.optString("date", LocalDate.now().toString()),
+                content = content,
+                updatedAt = summary.optLong("updatedAt", System.currentTimeMillis())
+            ))
         }
         schedule
     }

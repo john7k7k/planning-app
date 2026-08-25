@@ -413,9 +413,12 @@ private fun TaskCard(card: TaskCardModel, category: TaskCategoryEntity?, onSettl
                 }
                 IconButton(onEdit) { Icon(if (card.instance.settled) Icons.Default.Visibility else Icons.Default.Settings, if (card.instance.settled) "查閱任務" else "編輯任務") }
             }
-            if (task.description.isNotBlank()) {
-                Text(task.description, color = Color.Gray, maxLines = 1, modifier = Modifier.padding(top = 8.dp))
-                if (task.description.length > 28) TextButton({ detail = true }) { Text("查看詳細") }
+            val previewText = if (card.instance.settled) card.instance.result else task.description
+            if (previewText.isNotBlank()) {
+                Text(previewText, color = Color.Gray, maxLines = 1, modifier = Modifier.padding(top = 8.dp))
+                if (previewText.length > 28) TextButton({ detail = true }) { Text("查看詳細") }
+            } else if (card.instance.settled) {
+                Text("尚未填寫完成心得。", color = Color.Gray, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 8.dp))
             }
             LinearProgressIndicator(
                 progress = { card.instance.completionPercentage.divide(BigDecimal("100")).toFloat().coerceIn(0f, 1f) },
@@ -434,8 +437,8 @@ private fun TaskCard(card: TaskCardModel, category: TaskCategoryEntity?, onSettl
     }
     if (detail) AlertDialog(
         onDismissRequest = { detail = false },
-        title = { Text(task.name) },
-        text = { Text(task.description) },
+        title = { Text(if (card.instance.settled) "完成心得" else task.name) },
+        text = { Text(if (card.instance.settled) card.instance.result else task.description) },
         confirmButton = { TextButton({ detail = false }) { Text("關閉") } }
     )
 }
@@ -535,7 +538,7 @@ private fun DailySummaryCard(date: LocalDate, initial: String, save: (String) ->
                     Text("${date.format(DateTimeFormatter.ofPattern("M 月 d 日"))} 當日總結", fontWeight = FontWeight.Bold)
                     Text("記錄今天的收穫、感受或明日提醒。", color = Color.Gray, style = MaterialTheme.typography.labelSmall)
                 }
-                IconButton({ editing = !editing }) { Icon(if (editing) Icons.Default.Close else Icons.Default.Edit, if (editing) "收起編輯" else "編輯總結") }
+                IconButton({ editing = !editing }) { Icon(if (editing) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown, if (editing) "收起總結" else "展開總結") }
             }
             if (editing) {
                 Field("當日總結", text) { text = it }
@@ -1303,10 +1306,11 @@ private fun Settings(state: MissionUiState, vm: MissionViewModel) {
             create = vm::createSchedule,
             rename = vm::renameSchedule,
             delete = vm::deleteSchedule,
-            export = {
-                vm.exportSchedule { name, json ->
+            exportWithData = { includeCompletionData ->
+                vm.exportSchedule(includeCompletionData) { name, json ->
                     exportText = json
-                    exportLauncher.launch("${name.replace(Regex("[^A-Za-z0-9_\\-\u4e00-\u9fff]"), "_")}.json")
+                    val suffix = if (includeCompletionData) "_含完成資料" else ""
+                    exportLauncher.launch("${name.replace(Regex("[^A-Za-z0-9_\\-\u4e00-\u9fff]"), "_")}$suffix.json")
                 }
             },
             import = { scheduleImportLauncher.launch(arrayOf("application/json", "text/plain")) }
@@ -1502,11 +1506,13 @@ private fun MySchedules(
     create: (String) -> Unit,
     rename: (String, String) -> Unit,
     delete: (String) -> Unit,
-    export: () -> Unit,
+    exportWithData: (Boolean) -> Unit,
     import: () -> Unit
 ) {
     var creating by remember { mutableStateOf(false) }
     var editing by remember { mutableStateOf<ScheduleEntity?>(null) }
+    var choosingExport by remember { mutableStateOf(false) }
+    val export: () -> Unit = { choosingExport = true }
     Column(Modifier.fillMaxSize()) {
         SettingsHeader("我的行程", back)
         LazyColumn(Modifier.fillMaxSize().padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -1533,6 +1539,18 @@ private fun MySchedules(
         initialName = "",
         dismiss = { creating = false },
         save = { name -> create(name); creating = false }
+    )
+    if (choosingExport) AlertDialog(
+        onDismissRequest = { choosingExport = false },
+        title = { Text("選擇匯出內容") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text("純行程只包含任務類別、任務與商城商品；包含完成資料會額外帶入已完成任務的完成度、心得、獲得獎勵與每日總結，並將任務獎勵加到錢包。")
+                OutlinedButton(onClick = { exportWithData(false); choosingExport = false }, modifier = Modifier.fillMaxWidth()) { Text("純行程") }
+                Button(onClick = { exportWithData(true); choosingExport = false }, modifier = Modifier.fillMaxWidth()) { Text("包含完成資料") }
+            }
+        },
+        confirmButton = { TextButton({ choosingExport = false }) { Text("取消") } }
     )
     editing?.let { schedule ->
         ScheduleNameDialog(

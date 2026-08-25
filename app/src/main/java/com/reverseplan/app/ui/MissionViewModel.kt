@@ -140,6 +140,13 @@ class MissionViewModel(private val repo: MissionRepository) : ViewModel() {
     fun createSchedule(name: String) = viewModelScope.launch { runCatching { repo.createSchedule(name) }.onSuccess { say("行程已新增") }.onFailure(::fail) }
     fun renameSchedule(id: String, name: String) = viewModelScope.launch { runCatching { repo.renameSchedule(id, name) }.onSuccess { say("行程名稱已更新") }.onFailure(::fail) }
     fun deleteSchedule(id: String) = viewModelScope.launch { runCatching { repo.deleteSchedule(id) }.onSuccess { say("自訂行程已刪除") }.onFailure(::fail) }
+    fun exportSchedule(includeCompletionData: Boolean, onReady: (String, String) -> Unit) = viewModelScope.launch {
+        runCatching {
+            val schedule = _state.value.schedules.firstOrNull { it.id == activeScheduleId.value } ?: error("找不到行程")
+            schedule.name to repo.exportSchedule(schedule.id, includeCompletionData)
+        }.onSuccess { (name, json) -> onReady(name, json) }.onFailure(::fail)
+    }
+
     fun exportSchedule(onReady: (String, String) -> Unit) = viewModelScope.launch {
         runCatching { val schedule = _state.value.schedules.firstOrNull { it.id == activeScheduleId.value } ?: error("找不到行程"); schedule.name to repo.exportSchedule(schedule.id) }
             .onSuccess { (name, json) -> onReady(name, json) }.onFailure(::fail)

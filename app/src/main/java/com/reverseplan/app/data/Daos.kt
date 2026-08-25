@@ -57,6 +57,7 @@ interface ScheduleDao {
     @Delete suspend fun deletePuzzle(puzzle: SchedulePuzzleEntity)
     @Query("DELETE FROM schedule_puzzles WHERE scheduleId = :scheduleId") suspend fun deletePuzzlesForSchedule(scheduleId: String)
     @Query("SELECT * FROM daily_summaries WHERE scheduleId = :scheduleId ORDER BY date DESC") fun observeDailySummaries(scheduleId: String): Flow<List<DailySummaryEntity>>
+    @Query("SELECT * FROM daily_summaries WHERE scheduleId = :scheduleId ORDER BY date DESC") suspend fun dailySummaries(scheduleId: String): List<DailySummaryEntity>
     @Query("SELECT * FROM daily_summaries WHERE scheduleId = :scheduleId AND date = :date LIMIT 1") suspend fun dailySummary(scheduleId: String, date: String): DailySummaryEntity?
     @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun upsertDailySummary(summary: DailySummaryEntity)
     @Query("DELETE FROM daily_summaries WHERE scheduleId = :scheduleId AND date = :date") suspend fun deleteDailySummary(scheduleId: String, date: String)

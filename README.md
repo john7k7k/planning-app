@@ -14,3 +14,20 @@
 架構：Kotlin、Jetpack Compose、Material 3、MVVM、Repository Pattern、Room、Coroutines、StateFlow、DataStore（預留設定擴充）。貨幣與完成度核心計算採 `BigDecimal`，並以 Room TypeConverter 的字串形式保存，避免浮點誤差。
 
 需求：Android Studio（含 Android SDK 35）與 JDK 17。
+
+# 編譯
+在專案根目錄 C:\Users\user\Documents\逆襲計畫APP 開啟 PowerShell 後，使用：
+## 1. Debug APK
+.\gradlew.bat assembleDebug
+輸出位置：
+app\build\outputs\apk\debug\app-debug.apk
+## 2. Release APK（需已建立 keystore.properties）
+.\gradlew.bat assembleRelease
+輸出位置：
+app\build\outputs\apk\release\app-release.apk
+## 3. Release AAB（不是 ABB；Google Play 要用這個）
+.\gradlew.bat bundleRelease
+輸出位置：
+app\build\outputs\bundle\release\app-release.aab
+若 PowerShell 顯示 Java 問題，先執行：
+$env:JAVA_HOME='C:\Program Files\Microsoft\jdk-17.0.20.8-hotspot'
