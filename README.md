@@ -25,7 +25,7 @@ app\build\outputs\apk\debug\app-debug.apk
 .\gradlew.bat assembleRelease
 輸出位置：
 app\build\outputs\apk\release\app-release.apk
-## 3. Release AAB（不是 ABB；Google Play 要用這個）
+## 3. Release AAB
 .\gradlew.bat bundleRelease
 輸出位置：
 app\build\outputs\bundle\release\app-release.aab
