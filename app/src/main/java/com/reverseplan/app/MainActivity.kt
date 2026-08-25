@@ -13,6 +13,8 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -24,6 +26,9 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.zIndex
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -161,6 +166,10 @@ private data class RewardEntry(val reward: RewardSchedule) : TimelineEntry {
     } ?: "23:59"
     override val key: String get() = "reward-${reward.exchange.id}"
 }
+private data class CurrentTimeEntry(val currentTime: String) : TimelineEntry {
+    override val time: String get() = currentTime
+    override val key: String = "current-time"
+}
 
 @Composable
 private fun Dashboard(state: MissionUiState, vm: MissionViewModel, chooseDate: () -> Unit) {
@@ -169,29 +178,73 @@ private fun Dashboard(state: MissionUiState, vm: MissionViewModel, chooseDate: (
     var reviewing by remember { mutableStateOf<TaskCardModel?>(null) }
     var editingReward by remember { mutableStateOf<RewardSchedule?>(null) }
     var quickAdd by remember { mutableStateOf(false) }
+    var viewingCompleted by remember { mutableStateOf(false) }
+    var scrollToEntryKey by remember { mutableStateOf<String?>(null) }
+    var currentTime by remember { mutableStateOf(LocalTime.now()) }
+    val timelineListState = rememberLazyListState()
+    val density = LocalDensity.current
+    LaunchedEffect(Unit) {
+        while (true) {
+            currentTime = LocalTime.now()
+            delay(30_000)
+        }
+    }
     val data = if (state.isDateLoading) null else state.dashboard
-    val entries = remember(data) {
-        (data?.cards.orEmpty().map(::TaskEntry) + data?.rewards.orEmpty().map(::RewardEntry)).sortedBy { it.time }
+    val entries = remember(data, state.selectedDate, currentTime) {
+        val isToday = state.selectedDate == LocalDate.now()
+        val scheduledEntries = data?.cards.orEmpty().map(::TaskEntry) + data?.rewards.orEmpty().map(::RewardEntry)
+        val currentEventIsVisible = isToday && (
+            data?.cards?.any { inRange(it.task.startTime, it.task.endTime, currentTime) } == true ||
+                data?.rewards?.any { rewardInRange(it, currentTime) } == true
+            )
+        (scheduledEntries +
+            if (isToday && scheduledEntries.isNotEmpty() && !currentEventIsVisible) listOf(CurrentTimeEntry(currentTime.toString().take(5))) else emptyList()
+        ).sortedBy { it.time }
+    }
+    LaunchedEffect(scrollToEntryKey, entries, state.isDateLoading) {
+        val key = scrollToEntryKey ?: return@LaunchedEffect
+        val entryIndex = entries.indexOfFirst { it.key == key }
+        if (state.isDateLoading || entryIndex < 0) return@LaunchedEffect
+        val viewportHeight = timelineListState.layoutInfo.let { it.viewportEndOffset - it.viewportStartOffset }
+        val estimatedCardHeight = with(density) {
+            when (val entry = entries[entryIndex]) {
+                is TaskEntry -> if (entry.card.instance.settled) 150.dp.roundToPx() else 205.dp.roundToPx()
+                is RewardEntry -> 96.dp.roundToPx()
+                is CurrentTimeEntry -> 28.dp.roundToPx()
+            }
+        }
+        val centeredOffset = -((viewportHeight - estimatedCardHeight).coerceAtLeast(0) / 2)
+        timelineListState.animateScrollToItem(index = 3 + entryIndex, scrollOffset = centeredOffset)
+        scrollToEntryKey = null
     }
     Box(Modifier.fillMaxSize()) {
         LazyColumn(
-            Modifier.fillMaxSize().padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
+            Modifier.fillMaxSize(),
+            state = timelineListState,
+            contentPadding = PaddingValues(vertical = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(0.dp)
         ) {
             item {
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
                     Text("每日行程", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
                     TextButton({ vm.loadDate(LocalDate.now()) }) { Icon(Icons.Default.Today, null); Spacer(Modifier.width(4.dp)); Text("回到今天") }
                     TextButton(chooseDate) { Icon(Icons.Default.CalendarMonth, null); Spacer(Modifier.width(4.dp)); Text("選擇日期") }
                 }
-                CalendarQuery(state.selectedDate, state.isDateLoading, vm::loadDate)
-                CurrentScheduleCard(state.currentDashboard)
+                Box(Modifier.padding(horizontal = 16.dp)) {
+                    CalendarQuery(state.selectedDate, state.isDateLoading, vm::loadDate)
+                }
+                Box(Modifier.padding(horizontal = 16.dp)) {
+                    CurrentScheduleCard(state.currentDashboard, currentTime) { card ->
+                        scrollToEntryKey = TaskEntry(card).key
+                        if (state.selectedDate != LocalDate.now()) vm.loadDate(LocalDate.now())
+                    }
+                }
             }
             if (state.isDateLoading) item {
-                DateLoadingCard()
+                Box(Modifier.padding(top = 12.dp, start = 16.dp, end = 16.dp)) { DateLoadingCard() }
             } else item {
                 val cards = data?.cards.orEmpty()
-                Card {
+                Card(modifier = Modifier.fillMaxWidth().padding(top = 12.dp, start = 16.dp, end = 16.dp).clickable(enabled = cards.any { it.instance.settled }) { viewingCompleted = true }) {
                     Row(Modifier.fillMaxWidth().padding(16.dp), horizontalArrangement = Arrangement.SpaceBetween) {
                         Column {
                             Text(if (state.selectedDate == LocalDate.now()) "今天進度" else "當日進度", fontWeight = FontWeight.Bold)
@@ -205,22 +258,26 @@ private fun Dashboard(state: MissionUiState, vm: MissionViewModel, chooseDate: (
                 }
             }
             if (!state.isDateLoading) {
-                item { Text("時間軸", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold) }
+                item { Text("時間軸", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 16.dp)) }
                 if (entries.isEmpty()) item { EmptyHint("這天尚未安排任務或獎勵。") }
-                items(entries, key = { it.key }) { entry ->
+                itemsIndexed(entries, key = { _, entry -> entry.key }) { _, entry ->
                     when (entry) {
                         is TaskEntry -> TimelineTask(
                             entry.card,
                             state.categories.firstOrNull { it.id == entry.card.task.categoryId },
+                            currentTime = currentTime.takeIf { state.selectedDate == LocalDate.now() },
                             onSettle = { settling = entry.card },
                             onEdit = { if (entry.card.instance.settled) reviewing = entry.card else editing = entry.card }
                         )
-                        is RewardEntry -> RewardTimelineItem(entry.reward) { editingReward = entry.reward }
+                        is RewardEntry -> RewardTimelineItem(entry.reward, currentTime.takeIf { state.selectedDate == LocalDate.now() }) { editingReward = entry.reward }
+                        is CurrentTimeEntry -> CurrentTimeTimelineMarker(entry.currentTime)
                     }
                 }
                 item {
                     val summary = state.dailySummaries.firstOrNull { it.date == state.selectedDate.toString() }?.content.orEmpty()
-                    DailySummaryCard(state.selectedDate, summary) { vm.saveDailySummary(state.selectedDate, it) }
+                    Box(Modifier.padding(top = 16.dp, start = 16.dp, end = 16.dp)) {
+                        DailySummaryCard(state.selectedDate, summary) { vm.saveDailySummary(state.selectedDate, it) }
+                    }
                 }
             }
             item { Spacer(Modifier.height(92.dp)) }
@@ -232,6 +289,16 @@ private fun Dashboard(state: MissionUiState, vm: MissionViewModel, chooseDate: (
             modifier = Modifier.align(Alignment.BottomEnd).padding(20.dp)
         )
     }
+    if (viewingCompleted) CompletedTasksDialog(
+        cards = data?.cards.orEmpty().filter { it.instance.settled }
+            .sortedBy { (it.instance.startTimeOverride ?: it.task.startTime).ifBlank { "99:99" } },
+        categories = state.categories,
+        dismiss = { viewingCompleted = false },
+        openTask = { card ->
+            viewingCompleted = false
+            scrollToEntryKey = TaskEntry(card).key
+        }
+    )
     settling?.let { card ->
         SettleDialog(card, { settling = null }) { progress, result, checked ->
             vm.settle(card.instance.id, progress, result, checked)
@@ -285,6 +352,42 @@ private fun Dashboard(state: MissionUiState, vm: MissionViewModel, chooseDate: (
 }
 
 @Composable
+private fun CompletedTasksDialog(cards: List<TaskCardModel>, categories: List<TaskCategoryEntity>, dismiss: () -> Unit, openTask: (TaskCardModel) -> Unit) {
+    AlertDialog(
+        onDismissRequest = dismiss,
+        title = { Text("已完成任務") },
+        text = {
+            if (cards.isEmpty()) Text("這天尚未有已結算的任務。", color = Color.Gray)
+            else LazyColumn(Modifier.heightIn(max = 360.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                items(cards, key = { it.instance.id }) { card ->
+                    val category = categories.firstOrNull { it.id == card.task.categoryId }
+                    Card(
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFFEAF8ED)),
+                        modifier = Modifier.fillMaxWidth().clickable { openTask(card) }
+                    ) {
+                        Column(Modifier.padding(12.dp)) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(category?.icon ?: "📌", style = MaterialTheme.typography.titleMedium)
+                                Column(Modifier.padding(start = 8.dp).weight(1f)) {
+                                    Text(card.task.name, fontWeight = FontWeight.Bold)
+                                    Text(category?.name ?: "其他", color = Color.Gray, style = MaterialTheme.typography.labelSmall)
+                                }
+                                Text(listOf(card.task.startTime, card.task.endTime).filter { it.isNotBlank() }.joinToString(" ～ ").ifBlank { "全天" }, color = Violet, style = MaterialTheme.typography.labelSmall)
+                            }
+                            Text("完成度 ${card.instance.completionPercentage}%", color = Color.Gray, style = MaterialTheme.typography.labelSmall)
+                            card.instance.result.takeIf { it.isNotBlank() }?.let { result ->
+                                Text(result, color = Color.Gray, maxLines = 1, modifier = Modifier.padding(top = 4.dp))
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(dismiss) { Text("關閉") } }
+    )
+}
+
+@Composable
 private fun DateLoadingCard() {
     Card(Modifier.fillMaxWidth()) {
         Row(Modifier.padding(22.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.Center) {
@@ -312,8 +415,7 @@ private fun CalendarQuery(date: LocalDate, isLoading: Boolean, select: (LocalDat
 private fun weekdayText(date: LocalDate): String = listOf("星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日")[date.dayOfWeek.value - 1]
 
 @Composable
-private fun CurrentScheduleCard(data: DashboardData?) {
-    val now = LocalTime.now()
+private fun LegacyCurrentScheduleCard(data: DashboardData?, now: LocalTime, openTask: (TaskCardModel) -> Unit) {
     val task = data?.cards?.firstOrNull { card -> inRange(card.task.startTime, card.task.endTime, now) }
     val reward = data?.rewards?.firstOrNull { reward ->
         val zone = ZoneId.systemDefault()
@@ -321,15 +423,25 @@ private fun CurrentScheduleCard(data: DashboardData?) {
         val end = reward.exchange.scheduledEndAt?.let { Instant.ofEpochMilli(it).atZone(zone).toLocalTime() } ?: return@firstOrNull false
         now >= start && now < end
     }
-    Card(colors = CardDefaults.cardColors(containerColor = Ink), shape = RoundedCornerShape(24.dp), modifier = Modifier.fillMaxWidth()) {
+    Card(
+        colors = CardDefaults.cardColors(containerColor = Ink),
+        shape = RoundedCornerShape(24.dp),
+        modifier = Modifier.fillMaxWidth().clickable(enabled = task != null) { task?.let(openTask) }
+    ) {
         Column(Modifier.padding(20.dp)) {
             Text("現在進行中", color = Color.White.copy(alpha = .7f))
             when {
                 task != null -> {
+                    (task.instance.descriptionOverride ?: task.task.description).takeIf { it.isNotBlank() }?.let { description ->
+                        Text(description, color = Color.White.copy(alpha = .78f), maxLines = 2, modifier = Modifier.padding(bottom = 6.dp))
+                    }
                     Text("⚔️ ${task.task.name}", color = Color.White, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
                     Text("${task.task.startTime} – ${task.task.endTime}", color = Gold)
                 }
                 reward != null -> {
+                    reward.exchange.note.ifBlank { reward.item.description }.takeIf { it.isNotBlank() }?.let { description ->
+                        Text(description, color = Color.White.copy(alpha = .78f), maxLines = 2, modifier = Modifier.padding(bottom = 6.dp))
+                    }
                     Text("${reward.item.emoji} ${reward.item.name}", color = Color.White, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
                     Text("獎勵時間", color = Gold)
                 }
@@ -339,38 +451,245 @@ private fun CurrentScheduleCard(data: DashboardData?) {
     }
 }
 
-private fun inRange(start: String, end: String, now: LocalTime): Boolean = runCatching {
-    start.isNotBlank() && end.isNotBlank() && now >= LocalTime.parse(start) && (end == "24:00" || now < LocalTime.parse(end))
-}.getOrDefault(false)
-
 @Composable
-private fun TimelineTask(card: TaskCardModel, category: TaskCategoryEntity?, onSettle: () -> Unit, onEdit: () -> Unit) {
-    Row(Modifier.fillMaxWidth()) {
-        Column(Modifier.width(64.dp).padding(top = 10.dp), horizontalAlignment = Alignment.End) {
-            Text(card.task.startTime.ifBlank { "全天" }, fontWeight = FontWeight.Bold)
-            if (card.task.endTime.isNotBlank()) Text(card.task.endTime, style = MaterialTheme.typography.labelSmall, color = Color.Gray)
+private fun IntermediateCurrentScheduleCard(data: DashboardData?, now: LocalTime, openTask: (TaskCardModel) -> Unit) {
+    val task = data?.cards?.firstOrNull { inRange(it.task.startTime, it.task.endTime, now) }
+    val reward = data?.rewards?.firstOrNull { rewardInRange(it, now) }
+    Card(
+        colors = CardDefaults.cardColors(containerColor = Ink),
+        shape = RoundedCornerShape(24.dp),
+        modifier = Modifier.fillMaxWidth().clickable(enabled = task != null) { task?.let(openTask) }
+    ) {
+        Column(Modifier.padding(20.dp)) {
+            Text("現在進行中", color = Color.White.copy(alpha = .7f))
+            when {
+                task != null -> {
+                    val description = task.instance.descriptionOverride ?: task.task.description
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(.48f)) {
+                            Text("📌 ${task.task.name}", color = Color.White, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, maxLines = 1)
+                            Text("${task.task.startTime} ～ ${task.task.endTime}", color = Gold)
+                        }
+                        description.takeIf { it.isNotBlank() }?.let {
+                            Text(it, color = Color.White.copy(alpha = .82f), maxLines = 2, modifier = Modifier.weight(.52f).padding(start = 12.dp))
+                        }
+                    }
+                }
+                reward != null -> {
+                    val description = reward.exchange.note.ifBlank { reward.item.description }
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(.48f)) {
+                            Text("${reward.item.emoji} ${reward.item.name}", color = Color.White, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, maxLines = 1)
+                            Text("獎勵行程", color = Gold)
+                        }
+                        description.takeIf { it.isNotBlank() }?.let {
+                            Text(it, color = Color.White.copy(alpha = .82f), maxLines = 2, modifier = Modifier.weight(.52f).padding(start = 12.dp))
+                        }
+                    }
+                }
+                else -> Text("目前沒有進行中的任務或獎勵。", color = Color.White, style = MaterialTheme.typography.titleMedium)
+            }
         }
-        Box(Modifier.width(22.dp).height(148.dp), contentAlignment = Alignment.TopCenter) {
-            Box(Modifier.width(2.dp).fillMaxHeight().background(priorityColor(card.task.priority) ?: Violet.copy(alpha = .35f)))
-            Surface(color = priorityColor(card.task.priority) ?: Violet, shape = RoundedCornerShape(20.dp), modifier = Modifier.size(14.dp)) {}
-        }
-        Box(Modifier.weight(1f).padding(bottom = 12.dp)) { TaskCard(card, category, onSettle, onEdit) }
     }
 }
 
 @Composable
-private fun RewardTimelineItem(reward: RewardSchedule, edit: () -> Unit) {
+private fun CurrentScheduleCard(data: DashboardData?, now: LocalTime, openTask: (TaskCardModel) -> Unit) {
+    val task = data?.cards?.firstOrNull { inRange(it.task.startTime, it.task.endTime, now) }
+    val reward = data?.rewards?.firstOrNull { rewardInRange(it, now) }
+    Card(
+        colors = CardDefaults.cardColors(containerColor = Ink),
+        shape = RoundedCornerShape(24.dp),
+        modifier = Modifier.fillMaxWidth().clickable(enabled = task != null) { task?.let(openTask) }
+    ) {
+        Column(Modifier.padding(20.dp)) {
+            Text("現在進行中", color = Color.White.copy(alpha = .7f))
+            when {
+                task != null -> {
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Text("📌 ${task.task.name}", color = Color.White, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, maxLines = 1, modifier = Modifier.weight(1f))
+                        Text("${task.task.startTime} ～ ${task.task.endTime}", color = Gold, style = MaterialTheme.typography.labelLarge)
+                    }
+                }
+                reward != null -> {
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Text("${reward.item.emoji} ${reward.item.name}", color = Color.White, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, maxLines = 1, modifier = Modifier.weight(1f))
+                        Text("獎勵行程", color = Gold, style = MaterialTheme.typography.labelLarge)
+                    }
+                }
+                else -> Text("目前沒有進行中的任務或獎勵。", color = Color.White, style = MaterialTheme.typography.titleMedium)
+            }
+        }
+    }
+}
+
+private fun inRange(start: String, end: String, now: LocalTime): Boolean = runCatching {
+    start.isNotBlank() && end.isNotBlank() && now >= LocalTime.parse(start) && (end == "24:00" || now < LocalTime.parse(end))
+}.getOrDefault(false)
+
+private fun rewardInRange(reward: RewardSchedule, now: LocalTime): Boolean {
+    val zone = ZoneId.systemDefault()
+    val start = reward.exchange.scheduledAt?.let { Instant.ofEpochMilli(it).atZone(zone).toLocalTime() } ?: return false
+    val end = reward.exchange.scheduledEndAt?.let { Instant.ofEpochMilli(it).atZone(zone).toLocalTime() } ?: return false
+    return now >= start && now < end
+}
+
+private fun timelineProgress(start: String, end: String, now: LocalTime): Float? = runCatching {
+    if (!inRange(start, end, now)) null else {
+        val startMinutes = LocalTime.parse(start).toSecondOfDay() / 60f
+        val endMinutes = if (end == "24:00") 1440f else LocalTime.parse(end).toSecondOfDay() / 60f
+        ((now.toSecondOfDay() / 60f - startMinutes) / (endMinutes - startMinutes)).coerceIn(0f, 1f)
+    }
+}.getOrNull()
+
+@Composable
+private fun CurrentTimeTimelineMarker(time: String) {
+    val red = Color(0xFFD92D20)
+    Box(Modifier.fillMaxWidth().height(28.dp), contentAlignment = Alignment.CenterStart) {
+        Box(Modifier.fillMaxWidth().height(2.dp).background(red))
+        Text(time, color = red, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelSmall, modifier = Modifier.padding(start = 8.dp).background(SoftBackground))
+        Surface(color = red, shape = RoundedCornerShape(20.dp), modifier = Modifier.padding(start = 68.dp).size(12.dp)) {}
+    }
+}
+
+@Composable
+private fun TimelineTask(
+    card: TaskCardModel,
+    category: TaskCategoryEntity?,
+    currentTime: LocalTime?,
+    onSettle: () -> Unit,
+    onEdit: () -> Unit
+) {
+    val nowProgress = currentTime?.let { timelineProgress(card.task.startTime, card.task.endTime, it) }
+    val axisLineColor = Violet.copy(alpha = .38f)
+    val axisNodeColor = Violet
+    var cardHeightPx by remember(card.instance.id) { mutableIntStateOf(0) }
+    val density = LocalDensity.current
+    val railTail = if (card.instance.settled) 8.dp else 24.dp
+    val railHeight = maxOf(148.dp, with(density) { cardHeightPx.toDp() }) + railTail
+    val rowModifier = Modifier.fillMaxWidth()
+    Box(rowModifier) {
+        Row(Modifier.fillMaxWidth().padding(end = 24.dp)) {
+            Box(Modifier.width(64.dp).height(railHeight).padding(top = 10.dp), contentAlignment = Alignment.TopEnd) {
+                Text(card.task.startTime.ifBlank { "全天" }, fontWeight = FontWeight.Bold)
+                if (card.task.endTime.isNotBlank()) Text(card.task.endTime, style = MaterialTheme.typography.labelSmall, color = Color.Gray, modifier = Modifier.align(Alignment.TopEnd).padding(top = 22.dp))
+            }
+            Box(Modifier.width(22.dp).height(railHeight), contentAlignment = Alignment.TopCenter) {
+                Box(Modifier.width(2.dp).fillMaxHeight().background(axisLineColor))
+                Surface(color = axisNodeColor, shape = RoundedCornerShape(20.dp), modifier = Modifier.size(14.dp)) {}
+            }
+            Spacer(Modifier.width(8.dp))
+            Box(
+                Modifier.weight(1f).padding(bottom = 12.dp).onSizeChanged { cardHeightPx = it.height }
+            ) {
+                TaskCard(card, category, onSettle, onEdit)
+            }
+        }
+        nowProgress?.let { progress ->
+            Box(
+                Modifier.align(Alignment.TopStart).padding(top = (10f + progress * (railHeight.value - 14f)).dp)
+                    .fillMaxWidth().height(2.dp).background(Color(0xFFD92D20)).zIndex(-1f)
+            )
+            Box(
+                Modifier.align(Alignment.TopEnd).padding(top = (10f + progress * (railHeight.value - 14f)).dp)
+                    .width(24.dp).height(2.dp).background(Color(0xFFD92D20))
+            )
+        }
+    }
+}
+
+@Composable
+private fun LegacyTimelineTask(card: TaskCardModel, category: TaskCategoryEntity?, currentTime: LocalTime?, onSettle: () -> Unit, onEdit: () -> Unit) {
+    val nowProgress = currentTime?.let { timelineProgress(card.task.startTime, card.task.endTime, it) }
+    Row(
+        Modifier.fillMaxWidth()
+            .then(if (card.instance.settled) Modifier.background(Color(0xFFE3F6E8), RoundedCornerShape(16.dp)).padding(vertical = 4.dp) else Modifier)
+    ) {
+        Box(Modifier.width(64.dp).height(148.dp).padding(top = 10.dp), contentAlignment = Alignment.TopEnd) {
+            Text(card.task.startTime.ifBlank { "全天" }, fontWeight = FontWeight.Bold)
+            if (card.task.endTime.isNotBlank()) Text(card.task.endTime, style = MaterialTheme.typography.labelSmall, color = Color.Gray, modifier = Modifier.align(Alignment.TopEnd).padding(top = 22.dp))
+            nowProgress?.let { progress ->
+                Text(currentTime.toString().take(5), color = Color(0xFFD92D20), fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelSmall, modifier = Modifier.align(Alignment.TopEnd).padding(top = (progress * 126f).dp))
+            }
+        }
+        Box(Modifier.width(22.dp).height(148.dp), contentAlignment = Alignment.TopCenter) {
+            Box(Modifier.width(2.dp).fillMaxHeight().background(priorityColor(card.task.priority) ?: Violet.copy(alpha = .35f)))
+            Surface(color = priorityColor(card.task.priority) ?: Violet, shape = RoundedCornerShape(20.dp), modifier = Modifier.size(14.dp)) {}
+            nowProgress?.let { progress ->
+                Box(Modifier.align(Alignment.TopCenter).padding(top = (progress * 134f).dp).fillMaxWidth().height(2.dp).background(Color(0xFFD92D20)))
+            }
+        }
+        Box(
+            Modifier.weight(1f).padding(bottom = 12.dp)
+        ) { TaskCard(card, category, onSettle, onEdit) }
+    }
+}
+
+@Composable
+private fun RewardTimelineItem(reward: RewardSchedule, currentTime: LocalTime?, edit: () -> Unit) {
     val zone = ZoneId.systemDefault()
     val start = reward.exchange.scheduledAt?.let { Instant.ofEpochMilli(it).atZone(zone).toLocalTime().toString().take(5) } ?: "未排時間"
     val end = reward.exchange.scheduledEndAt?.let { Instant.ofEpochMilli(it).atZone(zone).toLocalTime().toString().take(5) }.orEmpty()
+    val nowProgress = currentTime?.let { timelineProgress(start, end, it) }
+    val axisLineColor = Violet.copy(alpha = .38f)
+    val axisNodeColor = Violet
+    Box(Modifier.fillMaxWidth()) {
+        Row(Modifier.fillMaxWidth().padding(end = 24.dp)) {
+            Box(Modifier.width(64.dp).height(96.dp).padding(top = 10.dp), contentAlignment = Alignment.TopEnd) {
+                Text(start, fontWeight = FontWeight.Bold)
+                if (end.isNotBlank()) Text(end, style = MaterialTheme.typography.labelSmall, color = Color.Gray, modifier = Modifier.align(Alignment.TopEnd).padding(top = 22.dp))
+            }
+            Box(Modifier.width(22.dp).height(96.dp), contentAlignment = Alignment.TopCenter) {
+                Box(Modifier.width(2.dp).fillMaxHeight().background(axisLineColor))
+                Surface(color = axisNodeColor, shape = RoundedCornerShape(20.dp), modifier = Modifier.size(14.dp)) {}
+            }
+            Spacer(Modifier.width(8.dp))
+            Card(
+                colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF7DE)),
+                modifier = Modifier.weight(1f).padding(bottom = 12.dp).clickable(onClick = edit)
+            ) {
+                Column(Modifier.padding(14.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("${reward.item.emoji} ${reward.item.name}", fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                        Icon(Icons.Default.Settings, "編輯獎勵")
+                    }
+                    if (reward.exchange.note.isNotBlank()) Text(reward.exchange.note, color = Color.Gray)
+                }
+            }
+        }
+        nowProgress?.let { progress ->
+            Box(
+                Modifier.align(Alignment.TopStart).padding(top = (10f + progress * 82f).dp)
+                    .fillMaxWidth().height(2.dp).background(Color(0xFFD92D20)).zIndex(-1f)
+            )
+            Box(
+                Modifier.align(Alignment.TopEnd).padding(top = (10f + progress * 82f).dp)
+                    .width(24.dp).height(2.dp).background(Color(0xFFD92D20))
+            )
+        }
+    }
+}
+
+@Composable
+private fun LegacyRewardTimelineItem(reward: RewardSchedule, currentTime: LocalTime?, edit: () -> Unit) {
+    val zone = ZoneId.systemDefault()
+    val start = reward.exchange.scheduledAt?.let { Instant.ofEpochMilli(it).atZone(zone).toLocalTime().toString().take(5) } ?: "未排時間"
+    val end = reward.exchange.scheduledEndAt?.let { Instant.ofEpochMilli(it).atZone(zone).toLocalTime().toString().take(5) }.orEmpty()
+    val nowProgress = currentTime?.let { timelineProgress(start, end, it) }
     Row(Modifier.fillMaxWidth()) {
-        Column(Modifier.width(64.dp).padding(top = 10.dp), horizontalAlignment = Alignment.End) {
+        Box(Modifier.width(64.dp).height(96.dp).padding(top = 10.dp), contentAlignment = Alignment.TopEnd) {
             Text(start, fontWeight = FontWeight.Bold)
-            if (end.isNotBlank()) Text(end, style = MaterialTheme.typography.labelSmall, color = Color.Gray)
+            if (end.isNotBlank()) Text(end, style = MaterialTheme.typography.labelSmall, color = Color.Gray, modifier = Modifier.align(Alignment.TopEnd).padding(top = 22.dp))
+            nowProgress?.let { progress ->
+                Text(currentTime.toString().take(5), color = Color(0xFFD92D20), fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelSmall, modifier = Modifier.align(Alignment.TopEnd).padding(top = (progress * 74f).dp))
+            }
         }
         Box(Modifier.width(22.dp).height(96.dp), contentAlignment = Alignment.TopCenter) {
             Box(Modifier.width(2.dp).fillMaxHeight().background(Gold.copy(alpha = .45f)))
             Surface(color = Gold, shape = RoundedCornerShape(20.dp), modifier = Modifier.size(14.dp)) {}
+            nowProgress?.let { progress ->
+                Box(Modifier.align(Alignment.TopCenter).padding(top = (progress * 82f).dp).fillMaxWidth().height(2.dp).background(Color(0xFFD92D20)))
+            }
         }
         Card(
             colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF7DE)),
@@ -415,7 +734,7 @@ private fun TaskCard(card: TaskCardModel, category: TaskCategoryEntity?, onSettl
             }
             val previewText = if (card.instance.settled) card.instance.result else task.description
             if (previewText.isNotBlank()) {
-                Text(previewText, color = Color.Gray, maxLines = 1, modifier = Modifier.padding(top = 8.dp))
+                Text(previewText, color = Color.Gray, style = MaterialTheme.typography.bodyMedium, maxLines = 1, modifier = Modifier.padding(top = 8.dp))
                 if (previewText.length > 28) TextButton({ detail = true }) { Text("查看詳細") }
             } else if (card.instance.settled) {
                 Text("尚未填寫完成心得。", color = Color.Gray, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 8.dp))
