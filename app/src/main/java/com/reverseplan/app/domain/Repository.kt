@@ -348,28 +348,8 @@ class MissionRepository(private val db: AppDatabase) {
                 checkedChecklistItems = completion.optString("checkedChecklistItems")
             )
             if (existingInstance == null) taskDao.insertInstance(importedInstance) else taskDao.updateInstance(importedInstance)
-            if (importedInstance.settled) {
-                val oldWallet = walletDao.wallet() ?: WalletEntity()
-                val updatedWallet = oldWallet.copy(
-                    coins = oldWallet.coins + importedInstance.earnedCoins,
-                    diamonds = oldWallet.diamonds + importedInstance.earnedDiamonds,
-                    updatedAt = System.currentTimeMillis()
-                )
-                walletDao.save(updatedWallet)
-                walletDao.transaction(TransactionEntity(
-                    type = TransactionType.TASK_REWARD,
-                    coinChange = importedInstance.earnedCoins,
-                    diamondChange = importedInstance.earnedDiamonds,
-                    coinsBefore = oldWallet.coins,
-                    coinsAfter = updatedWallet.coins,
-                    diamondsBefore = oldWallet.diamonds,
-                    diamondsAfter = updatedWallet.diamonds,
-                    relatedTaskInstanceId = importedInstance.id,
-                    scheduleId = schedule.id,
-                    createdAt = importedInstance.settledAt ?: System.currentTimeMillis(),
-                    note = "匯入任務完成獎勵"
-                ))
-            }
+            // Completion history is preserved, but an import never changes the wallet
+            // or creates a new currency transaction for already-settled tasks.
         }
         val dailySummaries = source.optJSONArray("dailySummaries") ?: JSONArray()
         for (i in 0 until dailySummaries.length()) {
