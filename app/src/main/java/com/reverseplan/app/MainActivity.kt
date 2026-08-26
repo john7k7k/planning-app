@@ -378,8 +378,15 @@ private fun Dashboard(state: MissionUiState, vm: MissionViewModel, chooseDate: (
             categories = state.categories,
             allowRepeat = false,
             dismiss = { quickAddInitial = null },
+            previewTimelineOverwrite = { date, start, end, onReady, onFailure ->
+                vm.previewTimelineOverwrite(date, start, end, onReady, onFailure)
+            },
             save = { task ->
                 vm.addTimelineTask(task.copy(timelineOnly = true, repeatType = RepeatType.NONE))
+                quickAddInitial = null
+            },
+            overwrite = { task, strategy ->
+                vm.addTimelineTaskWithOverwrite(task.copy(timelineOnly = true, repeatType = RepeatType.NONE), strategy)
                 quickAddInitial = null
             }
         )
@@ -988,6 +995,9 @@ private fun TaskLibrary(state: MissionUiState, vm: MissionViewModel) {
             categories = state.categories,
             allowRepeat = true,
             dismiss = { creatingInitial = null },
+            previewTimelineOverwrite = { date, start, end, onReady, onFailure ->
+                vm.previewTimelineOverwrite(date, start, end, onReady, onFailure)
+            },
             save = { task -> vm.saveTask(task); creatingInitial = null }
         )
     }
@@ -998,6 +1008,9 @@ private fun TaskLibrary(state: MissionUiState, vm: MissionViewModel) {
             categories = state.categories,
             allowRepeat = true,
             dismiss = { editing = null },
+            previewTimelineOverwrite = { date, start, end, onReady, onFailure ->
+                vm.previewTimelineOverwrite(date, start, end, onReady, onFailure, excludeTaskId = task.id)
+            },
             save = { updated -> vm.saveTask(updated); editing = null },
             delete = { vm.deleteTask(task); editing = null }
         )
@@ -1076,6 +1089,8 @@ private fun TaskFormDialog(
     allowRepeat: Boolean,
     dismiss: () -> Unit,
     save: (TaskEntity) -> Unit,
+    previewTimelineOverwrite: ((String, String, String, (TimelineOverwritePreview) -> Unit, (String) -> Unit) -> Unit)? = null,
+    overwrite: ((TaskEntity, TimelineOverwriteStrategy) -> Unit)? = null,
     delete: (() -> Unit)? = null
 ) {
     var name by remember(initial.id) { mutableStateOf(initial.name) }
@@ -1102,6 +1117,52 @@ private fun TaskFormDialog(
     }
     var intervalDays by remember(initial.id) { mutableStateOf(initial.repeatConfig.substringAfter("interval=", "1").ifBlank { "1" }) }
     var monthDay by remember(initial.id) { mutableStateOf(initial.repeatConfig.substringAfter("monthDay=", "").ifBlank { LocalDate.parse(initial.startDate).dayOfMonth.toString() }) }
+    var overwritePreview by remember(initial.id) { mutableStateOf<TimelineOverwritePreview?>(null) }
+    var overwritePreviewKey by remember(initial.id) { mutableStateOf("") }
+    var overwritePreviewError by remember(initial.id) { mutableStateOf<String?>(null) }
+    var pendingOverwrite by remember(initial.id) { mutableStateOf<TaskEntity?>(null) }
+    val currentTimeKey = "$date|$start|$end"
+    val needsOverwritePreview = previewTimelineOverwrite != null && !allDay && date.length == 10 && start.length == 5 && end.length == 5
+    LaunchedEffect(date, start, end, allDay, previewTimelineOverwrite != null) {
+        overwritePreview = null
+        overwritePreviewKey = ""
+        overwritePreviewError = null
+        if (needsOverwritePreview) {
+            previewTimelineOverwrite?.invoke(date, start, end, { result ->
+                overwritePreview = result
+                overwritePreviewKey = currentTimeKey
+            }, { error -> overwritePreviewError = error })
+        }
+    }
+    val activeOverwritePreview = overwritePreview.takeIf { overwritePreviewKey == currentTimeKey }
+    fun draftTask(): TaskEntity {
+        val config = when (repeat) {
+            RepeatType.WEEKLY -> "days=" + (if (weekDays.isEmpty()) setOf(LocalDate.now().dayOfWeek.value) else weekDays).sorted().joinToString(",")
+            RepeatType.INTERVAL -> "interval=" + (intervalDays.toIntOrNull()?.coerceAtLeast(1) ?: 1)
+            RepeatType.MONTHLY -> "monthDay=" + monthDay.ifBlank {
+                runCatching { LocalDate.parse(date).dayOfMonth }.getOrDefault(LocalDate.now().dayOfMonth).toString()
+            }
+            else -> ""
+        }
+        return initial.copy(
+            name = name.trim(),
+            description = description,
+            startDate = date.ifBlank { LocalDate.now().toString() },
+            allDay = allDay,
+            startTime = if (allDay) "" else start,
+            endTime = if (allDay) "" else end,
+            locationName = location,
+            address = address,
+            rewardCoins = coins.toBigDecimalOrNull() ?: BigDecimal.ZERO,
+            rewardDiamonds = diamonds.toBigDecimalOrNull() ?: BigDecimal.ZERO,
+            categoryId = categoryId,
+            priority = priority,
+            checklist = checklist,
+            repeatType = repeat,
+            repeatConfig = config,
+            repeatEndDate = if (repeat == RepeatType.NONE) "" else repeatEndDate
+        )
+    }
     AlertDialog(
         onDismissRequest = dismiss,
         title = { Text(title) },
@@ -1117,6 +1178,9 @@ private fun TaskFormDialog(
                 if (!allDay) Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Field("開始 HH:mm", start, Modifier.weight(1f)) { start = it }
                     Field("結束 HH:mm", end, Modifier.weight(1f)) { end = it }
+                }
+                if (previewTimelineOverwrite != null && needsOverwritePreview) {
+                    TimelineOverwritePreviewHint(activeOverwritePreview, overwritePreviewError, allowOverwrite = overwrite != null)
                 }
                 Field("地點", location) { location = it }
                 Field("地址", address) { address = it }
@@ -1144,34 +1208,17 @@ private fun TaskFormDialog(
             }
         },
         confirmButton = {
-            Button(enabled = name.isNotBlank(), onClick = {
-                val config = when (repeat) {
-                    RepeatType.WEEKLY -> "days=" + (if (weekDays.isEmpty()) setOf(LocalDate.now().dayOfWeek.value) else weekDays).sorted().joinToString(",")
-                    RepeatType.INTERVAL -> "interval=" + (intervalDays.toIntOrNull()?.coerceAtLeast(1) ?: 1)
-                    RepeatType.MONTHLY -> "monthDay=" + monthDay.ifBlank {
-                        runCatching { LocalDate.parse(date).dayOfMonth }.getOrDefault(LocalDate.now().dayOfMonth).toString()
-                    }
-                    else -> ""
+            Button(
+                enabled = name.isNotBlank() &&
+                    (!needsOverwritePreview || activeOverwritePreview != null) &&
+                    activeOverwritePreview?.hasBlockingConflicts != true &&
+                    (overwrite != null || activeOverwritePreview?.hasOverwritableConflicts != true),
+                onClick = {
+                    val task = draftTask()
+                    if (activeOverwritePreview?.hasOverwritableConflicts == true && overwrite != null) pendingOverwrite = task
+                    else save(task)
                 }
-                save(initial.copy(
-                    name = name.trim(),
-                    description = description,
-                    startDate = date.ifBlank { LocalDate.now().toString() },
-                    allDay = allDay,
-                    startTime = if (allDay) "" else start,
-                    endTime = if (allDay) "" else end,
-                    locationName = location,
-                    address = address,
-                    rewardCoins = coins.toBigDecimalOrNull() ?: BigDecimal.ZERO,
-                    rewardDiamonds = diamonds.toBigDecimalOrNull() ?: BigDecimal.ZERO,
-                    categoryId = categoryId,
-                    priority = priority,
-                    checklist = checklist,
-                    repeatType = repeat,
-                    repeatConfig = config,
-                    repeatEndDate = if (repeat == RepeatType.NONE) "" else repeatEndDate
-                ))
-            }) { Text("儲存") }
+            ) { Text("儲存") }
         },
         dismissButton = {
             Row {
@@ -1181,6 +1228,101 @@ private fun TaskFormDialog(
                 TextButton(dismiss) { Text("取消") }
             }
         }
+    )
+    pendingOverwrite?.let { task ->
+        TimelineOverwriteConfirmationDialog(
+            title = "覆寫衝突日程？",
+            preview = activeOverwritePreview ?: return@let,
+            dismiss = { pendingOverwrite = null },
+            confirm = { strategy ->
+                pendingOverwrite = null
+                overwrite?.invoke(task, strategy) ?: save(task)
+            }
+        )
+    }
+}
+
+private fun TimelineConflictTarget.overwriteLabel(): String = "$name（$startTime ～ $endTime）"
+
+/** Inline, immediate feedback below the time fields for a one-off timeline item. */
+@Composable
+private fun TimelineOverwritePreviewHint(preview: TimelineOverwritePreview?, error: String?, allowOverwrite: Boolean = true) {
+    when {
+        error != null -> Text(error, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall)
+        preview == null -> Text("正在檢查時間衝突…", color = Color.Gray, style = MaterialTheme.typography.labelSmall)
+        preview.hasBlockingConflicts -> {
+            Text(
+                "已結算任務不可覆寫：${preview.protectedTasks.joinToString("、") { it.overwriteLabel() }}",
+                color = MaterialTheme.colorScheme.error,
+                style = MaterialTheme.typography.labelSmall
+            )
+        }
+        !preview.hasOverwritableConflicts -> Text("此時段沒有衝突日程。", color = Color(0xFF2EAD74), style = MaterialTheme.typography.labelSmall)
+        !allowOverwrite -> {
+            val tasks = preview.fullyCoveredTasks + preview.partiallyOverlappedTasks
+            val rewards = preview.fullyCoveredRewards + preview.partiallyOverlappedRewards
+            Text(
+                "任務庫任務不可覆寫既有日程：${(tasks + rewards).joinToString("、") { it.overwriteLabel() }}",
+                color = MaterialTheme.colorScheme.error,
+                style = MaterialTheme.typography.labelSmall
+            )
+        }
+        else -> Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            preview.fullyCoveredTasks.takeIf { it.isNotEmpty() }?.let {
+                Text("將完整覆寫任務：${it.joinToString("、") { target -> target.overwriteLabel() }}", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall)
+            }
+            preview.partiallyOverlappedTasks.takeIf { it.isNotEmpty() }?.let {
+                Text("部分重疊任務：${it.joinToString("、") { target -> target.overwriteLabel() }}", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall)
+            }
+            (preview.fullyCoveredRewards + preview.partiallyOverlappedRewards).takeIf { it.isNotEmpty() }?.let {
+                Text("衝突獎勵會取消並退款：${it.joinToString("、") { target -> target.overwriteLabel() }}", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall)
+            }
+        }
+    }
+}
+
+@Composable
+private fun TimelineOverwriteConfirmationDialog(
+    title: String,
+    preview: TimelineOverwritePreview,
+    dismiss: () -> Unit,
+    confirm: (TimelineOverwriteStrategy) -> Unit
+) {
+    var strategy by remember { mutableStateOf(TimelineOverwriteStrategy.TRIM_PARTIAL_TASKS) }
+    val rewards = preview.fullyCoveredRewards + preview.partiallyOverlappedRewards
+    AlertDialog(
+        onDismissRequest = dismiss,
+        title = { Text(title) },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("新日程會加入時間軸，以下項目將依你的選擇處理。", color = Color.Gray, style = MaterialTheme.typography.bodySmall)
+                preview.fullyCoveredTasks.takeIf { it.isNotEmpty() }?.let { targets ->
+                    Text("完整覆寫的任務", fontWeight = FontWeight.Bold)
+                    targets.forEach { Text("• ${it.overwriteLabel()}", style = MaterialTheme.typography.bodySmall) }
+                }
+                preview.partiallyOverlappedTasks.takeIf { it.isNotEmpty() }?.let { targets ->
+                    Text("部分重疊的任務", fontWeight = FontWeight.Bold)
+                    targets.forEach { Text("• ${it.overwriteLabel()}", style = MaterialTheme.typography.bodySmall) }
+                    Row(Modifier.fillMaxWidth().clickable { strategy = TimelineOverwriteStrategy.TRIM_PARTIAL_TASKS }, verticalAlignment = Alignment.CenterVertically) {
+                        RadioButton(strategy == TimelineOverwriteStrategy.TRIM_PARTIAL_TASKS, { strategy = TimelineOverwriteStrategy.TRIM_PARTIAL_TASKS })
+                        Column(Modifier.padding(start = 4.dp)) {
+                            Text("僅複寫重疊部分")
+                            Text("保留原任務未重疊的時間；被切開時會分成前後兩段。", style = MaterialTheme.typography.labelSmall, color = Color.Gray)
+                        }
+                    }
+                    Row(Modifier.fillMaxWidth().clickable { strategy = TimelineOverwriteStrategy.REMOVE_PARTIAL_TASKS }, verticalAlignment = Alignment.CenterVertically) {
+                        RadioButton(strategy == TimelineOverwriteStrategy.REMOVE_PARTIAL_TASKS, { strategy = TimelineOverwriteStrategy.REMOVE_PARTIAL_TASKS })
+                        Text("移除原有任務", Modifier.padding(start = 4.dp))
+                    }
+                }
+                rewards.takeIf { it.isNotEmpty() }?.let { targets ->
+                    Text("衝突的獎勵（將取消並退款）", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.error)
+                    targets.forEach { Text("• ${it.overwriteLabel()}", style = MaterialTheme.typography.bodySmall) }
+                }
+            }
+        },
+        confirmButton = { Button(onClick = { confirm(strategy) }) { Text("確認覆寫") } },
+        dismissButton = { TextButton(dismiss) { Text("取消") } }
     )
 }
 
@@ -1456,7 +1598,23 @@ private fun Shop(state: MissionUiState, vm: MissionViewModel) {
     }
     if (creating) ShopEditor({ creating = false }) { item -> vm.saveItem(item); creating = false }
     editing?.let { item -> ShopEditDialog(item, { editing = null }, { updated -> vm.saveItem(updated); editing = null }, { vm.deleteItem(item); editing = null }) }
-    redeeming?.let { item -> RewardScheduleDialog(item, { redeeming = null }) { date, start, end, note -> vm.exchange(item.id, date, start, end, note); redeeming = null } }
+    redeeming?.let { item ->
+        RewardScheduleDialog(
+            item = item,
+            dismiss = { redeeming = null },
+            previewTimelineOverwrite = { date, start, end, onReady, onFailure ->
+                vm.previewTimelineOverwrite(date, start, end, onReady, onFailure)
+            },
+            confirm = { date, start, end, note ->
+                vm.exchange(item.id, date, start, end, note)
+                redeeming = null
+            },
+            overwrite = { date, start, end, note, strategy ->
+                vm.exchangeWithOverwrite(item.id, date, start, end, note, strategy)
+                redeeming = null
+            }
+        )
+    }
 }
 
 @Composable
@@ -1504,12 +1662,46 @@ private fun ShopEditDialog(item: ShopItemEntity, dismiss: () -> Unit, save: (Sho
     )
 }
 
+private data class RewardScheduleRequest(val date: String, val start: String, val end: String, val note: String)
+
+private fun defaultRewardEnd(start: String, enteredEnd: String): String = when {
+    enteredEnd.isNotBlank() -> enteredEnd
+    start.length != 5 -> ""
+    start >= "23:00" -> "23:59"
+    else -> runCatching { LocalTime.parse(start).plusHours(1).toString().take(5) }.getOrDefault("")
+}
+
 @Composable
-private fun RewardScheduleDialog(item: ShopItemEntity, dismiss: () -> Unit, confirm: (String, String, String, String) -> Unit) {
+private fun RewardScheduleDialog(
+    item: ShopItemEntity,
+    dismiss: () -> Unit,
+    previewTimelineOverwrite: (String, String, String, (TimelineOverwritePreview) -> Unit, (String) -> Unit) -> Unit,
+    confirm: (String, String, String, String) -> Unit,
+    overwrite: (String, String, String, String, TimelineOverwriteStrategy) -> Unit
+) {
     var date by remember { mutableStateOf(LocalDate.now().toString()) }
     var start by remember { mutableStateOf("") }
     var end by remember { mutableStateOf("") }
     var note by remember { mutableStateOf("") }
+    var overwritePreview by remember { mutableStateOf<TimelineOverwritePreview?>(null) }
+    var overwritePreviewKey by remember { mutableStateOf("") }
+    var overwritePreviewError by remember { mutableStateOf<String?>(null) }
+    var pendingOverwrite by remember { mutableStateOf<RewardScheduleRequest?>(null) }
+    val effectiveEnd = defaultRewardEnd(start, end)
+    val currentTimeKey = "$date|$start|$effectiveEnd"
+    val needsOverwritePreview = date.length == 10 && start.length == 5 && effectiveEnd.length == 5
+    LaunchedEffect(date, start, end) {
+        overwritePreview = null
+        overwritePreviewKey = ""
+        overwritePreviewError = null
+        if (needsOverwritePreview) {
+            previewTimelineOverwrite(date, start, effectiveEnd, { result ->
+                overwritePreview = result
+                overwritePreviewKey = currentTimeKey
+            }, { error -> overwritePreviewError = error })
+        }
+    }
+    val activeOverwritePreview = overwritePreview.takeIf { overwritePreviewKey == currentTimeKey }
     AlertDialog(
         onDismissRequest = dismiss,
         title = { Text("安排獎勵：${item.name}") },
@@ -1517,11 +1709,32 @@ private fun RewardScheduleDialog(item: ShopItemEntity, dismiss: () -> Unit, conf
             Text("結束時間留白時預設為一小時後；23:00 以後預設 23:59。", color = Color.Gray, style = MaterialTheme.typography.bodySmall)
             Field("獎勵日期 YYYY-MM-DD", date) { date = it }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { Field("開始 HH:mm", start, Modifier.weight(1f)) { start = it }; Field("結束 HH:mm", end, Modifier.weight(1f)) { end = it } }
+            if (needsOverwritePreview) TimelineOverwritePreviewHint(activeOverwritePreview, overwritePreviewError)
             Field("描述", note) { note = it }
         } },
-        confirmButton = { Button(onClick = { confirm(date, start, end, note) }) { Text("兌換並安排") } },
+        confirmButton = {
+            Button(
+                enabled = !needsOverwritePreview || (activeOverwritePreview != null && activeOverwritePreview.hasBlockingConflicts.not()),
+                onClick = {
+                    val request = RewardScheduleRequest(date, start, end, note)
+                    if (activeOverwritePreview?.hasOverwritableConflicts == true) pendingOverwrite = request
+                    else confirm(request.date, request.start, request.end, request.note)
+                }
+            ) { Text("兌換並安排") }
+        },
         dismissButton = { TextButton(dismiss) { Text("取消") } }
     )
+    pendingOverwrite?.let { request ->
+        TimelineOverwriteConfirmationDialog(
+            title = "覆寫衝突日程並兌換？",
+            preview = activeOverwritePreview ?: return@let,
+            dismiss = { pendingOverwrite = null },
+            confirm = { strategy ->
+                pendingOverwrite = null
+                overwrite(request.date, request.start, request.end, request.note, strategy)
+            }
+        )
+    }
 }
 
 @Composable

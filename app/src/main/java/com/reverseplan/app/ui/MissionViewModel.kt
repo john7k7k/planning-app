@@ -7,6 +7,7 @@ import com.reverseplan.app.TaskNotificationScheduler
 import com.reverseplan.app.data.*
 import com.reverseplan.app.domain.*
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
@@ -48,6 +49,7 @@ class MissionViewModel(
     private val dailyCache = mutableMapOf<String, DailyCacheValue>()
     private var dateQueryJob: Job? = null
     private var prefetchJob: Job? = null
+    private var overwritePreviewJob: Job? = null
 
     init {
         viewModelScope.launch { repo.initialize() }
@@ -188,6 +190,24 @@ class MissionViewModel(
     fun addTimelineTask(task: TaskEntity) = viewModelScope.launch {
         runCatching { repo.createTimelineTask(task.copy(scheduleId = activeScheduleId.value)) }.onSuccess { say("單次任務已加入時間軸"); refresh(); loadMonth(_state.value.selectedMonth) }.onFailure(::fail)
     }
+    fun previewTimelineOverwrite(date: String, start: String, end: String, onReady: (TimelineOverwritePreview) -> Unit, onFailure: (String) -> Unit, excludeTaskId: String? = null) {
+        overwritePreviewJob?.cancel()
+        val scheduleId = activeScheduleId.value
+        overwritePreviewJob = viewModelScope.launch {
+            try {
+                onReady(repo.timelineOverwritePreview(scheduleId, date, start, end, excludeTaskId))
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
+                onFailure(error.message ?: "無法檢查時間衝突")
+            }
+        }
+    }
+    fun addTimelineTaskWithOverwrite(task: TaskEntity, strategy: TimelineOverwriteStrategy) = viewModelScope.launch {
+        runCatching { repo.createTimelineTaskWithOverwrite(task.copy(scheduleId = activeScheduleId.value), strategy) }
+            .onSuccess { say("單次任務已加入時間軸並套用覆寫"); refresh(); loadMonth(_state.value.selectedMonth) }
+            .onFailure(::fail)
+    }
     fun deleteTask(task: TaskEntity) = viewModelScope.launch { runCatching { repo.deleteTask(task) }.onSuccess { say("任務已刪除"); refresh(); loadMonth(_state.value.selectedMonth) }.onFailure(::fail) }
     fun saveCategory(name: String, icon: String) = viewModelScope.launch { runCatching { repo.saveCategory(activeScheduleId.value, name, icon) }.onSuccess { say("分類已新增") }.onFailure(::fail) }
     fun updateCategory(category: TaskCategoryEntity, name: String, icon: String) = viewModelScope.launch { runCatching { repo.updateCategory(activeScheduleId.value, category, name, icon) }.onSuccess { say("分類已更新"); refresh() }.onFailure(::fail) }
@@ -209,10 +229,15 @@ class MissionViewModel(
     fun deleteItem(item: ShopItemEntity) = viewModelScope.launch { runCatching { repo.deleteItem(item) }.onSuccess { say("商品已刪除"); refresh() }.onFailure(::fail) }
     fun exchange(id: String, date: String, startTime: String, endTime: String, note: String) = viewModelScope.launch {
         runCatching {
-            val scheduledAt = if (date.isBlank() && startTime.isBlank()) null else LocalDate.parse(date.ifBlank { LocalDate.now().toString() }).atTime(LocalTime.parse(startTime.ifBlank { "00:00" })).atZone(ZoneId.systemDefault()).toInstant().toEpochMilli()
-            val scheduledEndAt = scheduledAt?.let { val day = LocalDate.parse(date.ifBlank { LocalDate.now().toString() }); val start = LocalTime.parse(startTime.ifBlank { "00:00" }); val end = if (endTime.isBlank()) { if (start.hour >= 23) LocalTime.of(23, 59) else start.plusHours(1) } else LocalTime.parse(endTime); day.atTime(end).atZone(ZoneId.systemDefault()).toInstant().toEpochMilli() }
+            val (scheduledAt, scheduledEndAt) = rewardScheduleTimes(date, startTime, endTime)
             repo.exchange(activeScheduleId.value, id, scheduledAt, scheduledEndAt, note).getOrThrow()
         }.onSuccess { say("兌換成功，獎勵已安排"); refresh() }.onFailure(::fail)
+    }
+    fun exchangeWithOverwrite(id: String, date: String, startTime: String, endTime: String, note: String, strategy: TimelineOverwriteStrategy) = viewModelScope.launch {
+        runCatching {
+            val (scheduledAt, scheduledEndAt) = rewardScheduleTimes(date, startTime, endTime)
+            repo.exchangeWithOverwrite(activeScheduleId.value, id, scheduledAt, scheduledEndAt, note, strategy).getOrThrow()
+        }.onSuccess { say("兌換成功，已覆寫衝突日程並退款舊獎勵"); refresh() }.onFailure(::fail)
     }
     fun updateRewardInstance(id: String, date: String, start: String, end: String, note: String) = viewModelScope.launch { runCatching { val day = LocalDate.parse(date); repo.updateRewardInstance(id, day.atTime(LocalTime.parse(start)).atZone(ZoneId.systemDefault()).toInstant().toEpochMilli(), day.atTime(LocalTime.parse(end)).atZone(ZoneId.systemDefault()).toInstant().toEpochMilli(), note) }.onSuccess { say("獎勵日程已更新"); refresh() }.onFailure(::fail) }
     fun deleteRewardInstance(id: String) = viewModelScope.launch { runCatching { repo.deleteRewardInstance(id) }.onSuccess { say("獎勵已取消，貨幣已退回"); refresh() }.onFailure(::fail) }
@@ -220,6 +245,21 @@ class MissionViewModel(
     fun consumeMessage() = _state.update { it.copy(message = null, error = null) }
     private fun say(text: String) = _state.update { it.copy(message = text, error = null) }
     private fun fail(error: Throwable) = _state.update { it.copy(error = error.message ?: "發生未知錯誤") }
+
+    private fun rewardScheduleTimes(dateText: String, startText: String, endText: String): Pair<Long?, Long?> {
+        if (startText.isBlank()) return null to null
+        val day = LocalDate.parse(dateText.ifBlank { LocalDate.now().toString() })
+        val start = LocalTime.parse(startText)
+        val end = when {
+            endText.isBlank() -> if (start.hour >= 23) LocalTime.of(23, 59) else start.plusHours(1)
+            endText == "24:00" -> null
+            else -> LocalTime.parse(endText)
+        }
+        val startAt = day.atTime(start).atZone(ZoneId.systemDefault()).toInstant().toEpochMilli()
+        val endAt = if (end == null) day.plusDays(1).atStartOfDay(ZoneId.systemDefault()).toInstant().toEpochMilli()
+        else day.atTime(end).atZone(ZoneId.systemDefault()).toInstant().toEpochMilli()
+        return startAt to endAt
+    }
 }
 
 class MissionViewModelFactory(

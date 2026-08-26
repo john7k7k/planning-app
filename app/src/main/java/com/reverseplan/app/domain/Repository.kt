@@ -52,6 +52,62 @@ data class PuzzleApplicationPreview(
     val latestFullStart: String?
 )
 
+/**
+ * A timed item already occupying the timeline while a one-off item is being
+ * created.  `fullyCovered` means the proposed item contains the whole old
+ * interval; otherwise only part of the old interval overlaps.
+ */
+data class TimelineConflictTarget(
+    val id: String,
+    val name: String,
+    val startTime: String,
+    val endTime: String,
+    val fullyCovered: Boolean
+)
+
+/** How partially-overlapped unfinished tasks are handled on confirmation. */
+enum class TimelineOverwriteStrategy { TRIM_PARTIAL_TASKS, REMOVE_PARTIAL_TASKS }
+
+/**
+ * Preview shown below the time fields before a timeline-only task or reward is
+ * saved. Rewards are always removed and refunded when they overlap.
+ */
+data class TimelineOverwritePreview(
+    val fullyCoveredTasks: List<TimelineConflictTarget> = emptyList(),
+    val partiallyOverlappedTasks: List<TimelineConflictTarget> = emptyList(),
+    val fullyCoveredRewards: List<TimelineConflictTarget> = emptyList(),
+    val partiallyOverlappedRewards: List<TimelineConflictTarget> = emptyList(),
+    /** Completed tasks retain their history and therefore cannot be overwritten. */
+    val protectedTasks: List<TimelineConflictTarget> = emptyList()
+) {
+    val hasOverwritableConflicts: Boolean
+        get() = fullyCoveredTasks.isNotEmpty() || partiallyOverlappedTasks.isNotEmpty() ||
+            fullyCoveredRewards.isNotEmpty() || partiallyOverlappedRewards.isNotEmpty()
+    val hasBlockingConflicts: Boolean get() = protectedTasks.isNotEmpty()
+}
+
+private data class TimelineWindow(val day: LocalDate, val start: LocalDateTime, val end: LocalDateTime)
+private data class TaskTimelineConflict(
+    val template: TaskEntity,
+    val instance: TaskInstanceEntity,
+    val effective: TaskEntity,
+    val start: LocalDateTime,
+    val end: LocalDateTime,
+    val fullyCovered: Boolean
+)
+private data class RewardTimelineConflict(
+    val item: ShopItemEntity,
+    val exchange: ShopExchangeEntity,
+    val start: Instant,
+    val end: Instant,
+    val fullyCovered: Boolean
+)
+private data class TimelineConflicts(
+    val tasks: List<TaskTimelineConflict>,
+    val rewards: List<RewardTimelineConflict>,
+    val protectedTasks: List<TaskTimelineConflict>
+)
+
 class MissionRepository(private val db: AppDatabase) {
     private val taskDao = db.taskDao()
     private val categoryDao = db.taskCategoryDao()
@@ -519,6 +575,46 @@ class MissionRepository(private val db: AppDatabase) {
         taskDao.upsert(event); taskDao.insertInstance(TaskInstanceEntity(taskId = event.id, scheduledDate = event.startDate))
     }
 
+    /** Creates a timeline-only task after applying the strategy selected in its conflict preview. */
+    suspend fun createTimelineTaskWithOverwrite(task: TaskEntity, strategy: TimelineOverwriteStrategy) = db.withTransaction {
+        require(task.repeatType == RepeatType.NONE) { "時間軸單次任務不可設定重複週期" }
+        val event = task.copy(timelineOnly = true, repeatType = RepeatType.NONE, repeatConfig = "", repeatEndDate = "", updatedAt = System.currentTimeMillis())
+        validateTask(event)
+        event.timedWindowOrNull()?.let { applyTimelineOverwrite(event.scheduleId, it, strategy) }
+        taskDao.upsert(event)
+        taskDao.insertInstance(TaskInstanceEntity(taskId = event.id, scheduledDate = event.startDate))
+    }
+
+    /**
+     * Returns the exact items a new timeline-only task/reward would replace.
+     * It is intentionally independent of the task library: the preview only
+     * changes concrete instances, never a library task's repeat definition.
+     */
+    suspend fun timelineOverwritePreview(scheduleId: String, date: String, start: String, end: String, excludeTaskId: String? = null): TimelineOverwritePreview {
+        val conflicts = collectTimelineConflicts(scheduleId, timedWindow(date, start, end), excludeTaskId = excludeTaskId)
+        fun TaskTimelineConflict.target() = TimelineConflictTarget(
+            id = instance.id,
+            name = effective.name,
+            startTime = effective.startTime,
+            endTime = effective.endTime,
+            fullyCovered = fullyCovered
+        )
+        fun RewardTimelineConflict.target() = TimelineConflictTarget(
+            id = exchange.id,
+            name = item.name,
+            startTime = this.start.atZone(ZoneId.systemDefault()).toLocalTime().toString().take(5),
+            endTime = this.end.atZone(ZoneId.systemDefault()).toLocalTime().toString().take(5),
+            fullyCovered = fullyCovered
+        )
+        return TimelineOverwritePreview(
+            fullyCoveredTasks = conflicts.tasks.filter { it.fullyCovered }.map { it.target() },
+            partiallyOverlappedTasks = conflicts.tasks.filterNot { it.fullyCovered }.map { it.target() },
+            fullyCoveredRewards = conflicts.rewards.filter { it.fullyCovered }.map { it.target() },
+            partiallyOverlappedRewards = conflicts.rewards.filterNot { it.fullyCovered }.map { it.target() },
+            protectedTasks = conflicts.protectedTasks.map { it.target() }
+        )
+    }
+
     suspend fun deleteTask(task: TaskEntity) = db.withTransaction { taskDao.deleteInstancesForTask(task.id); taskDao.clearPrerequisites(task.id); taskDao.delete(task) }
 
     private suspend fun createsCycle(taskId: String, candidate: String): Boolean {
@@ -587,7 +683,11 @@ class MissionRepository(private val db: AppDatabase) {
     suspend fun updateInstanceContent(instanceId: String, name: String, description: String, location: String, address: String, allDay: Boolean, start: String, end: String, coins: BigDecimal, diamonds: BigDecimal, categoryId: String, priority: TaskPriority, checklist: String) = db.withTransaction {
         val instance = taskDao.instanceById(instanceId) ?: error("找不到任務實例")
         check(!instance.settled) { "已完成任務請先撤回，才能修改任務資訊" }
-        if (!allDay && start.isNotBlank() && end.isNotBlank()) require(parseEndTime(end).isAfter(LocalTime.parse(start))) { "結束時間必須晚於開始時間" }
+        val template = taskDao.task(instance.taskId) ?: error("找不到任務類別")
+        if (!allDay && start.isNotBlank() && end.isNotBlank()) {
+            require(parseEndTime(end).isAfter(LocalTime.parse(start))) { "結束時間必須晚於開始時間" }
+            checkNoTimelineConflict(template.scheduleId, timedWindow(instance.scheduledDate, start, end), excludeInstanceId = instance.id)
+        }
         taskDao.updateInstance(instance.copy(nameOverride = name, descriptionOverride = description, locationOverride = location, addressOverride = address, allDayOverride = allDay, startTimeOverride = if (allDay) "" else start, endTimeOverride = if (allDay) "" else end, rewardCoinsOverride = coins, rewardDiamondsOverride = diamonds, categoryIdOverride = categoryId, priorityOverride = priority, checklistOverride = checklist))
     }
 
@@ -642,17 +742,14 @@ class MissionRepository(private val db: AppDatabase) {
         val start = runCatching { LocalTime.parse(startText) }.getOrNull() ?: return listOf("開始時間格式須為 HH:mm")
         val end = runCatching { parseEndTime(endText) }.getOrNull() ?: return listOf("結束時間格式須為 HH:mm")
         if (!end.isAfter(start)) return listOf("結束時間必須晚於開始時間")
-        // 以實際仍存在於當日日程的實例為準。拼圖覆寫的項目會保留歷史實例，
-        // 但標記為 deleted，因此不能再由類別定義回推成衝突。
-        ensure(day, scheduleId)
-        return taskDao.instancesForDate(date).filter { instance ->
-            !instance.deleted && instance.id != excludeInstanceId &&
-                (excludeInstanceId != null || instance.taskId != excludeTaskId)
-        }.mapNotNull { instance ->
-            val task = taskDao.task(instance.taskId) ?: return@mapNotNull null
-            if (task.scheduleId != scheduleId) return@mapNotNull null
-            val effective = effectiveTask(task, instance)
-            if (!effective.allDay && effective.startTime.isNotBlank() && effective.endTime.isNotBlank() && start < parseEndTime(effective.endTime) && LocalTime.parse(effective.startTime) < end) "與日程「${effective.name}」(${effective.startTime}–${effective.endTime}) 重疊" else null
+        val window = timedWindow(date, startText, endText)
+        val conflicts = collectTimelineConflicts(scheduleId, window, excludeTaskId, excludeInstanceId)
+        return buildList {
+            conflicts.tasks.forEach { add("與日程「${it.effective.name}」(${it.effective.startTime}–${it.effective.endTime}) 重疊") }
+            conflicts.protectedTasks.forEach { add("與已結算日程「${it.effective.name}」(${it.effective.startTime}–${it.effective.endTime}) 重疊") }
+            conflicts.rewards.forEach { conflict ->
+                add("與獎勵「${conflict.item.name}」(${conflict.start.atZone(ZoneId.systemDefault()).toLocalTime().toString().take(5)}–${conflict.end.atZone(ZoneId.systemDefault()).toLocalTime().toString().take(5)}) 重疊")
+            }
         }.distinct()
     }
 
@@ -690,36 +787,230 @@ class MissionRepository(private val db: AppDatabase) {
     }
     private fun limitStart(type: LimitType): Long = when (type) { LimitType.TOTAL, LimitType.UNLIMITED -> 0L; LimitType.DAILY -> LocalDate.now().atStartOfDay(ZoneId.systemDefault()).toInstant().toEpochMilli(); LimitType.WEEKLY -> LocalDate.now().minusDays((LocalDate.now().dayOfWeek.value - 1).toLong()).atStartOfDay(ZoneId.systemDefault()).toInstant().toEpochMilli(); LimitType.MONTHLY -> LocalDate.now().withDayOfMonth(1).atStartOfDay(ZoneId.systemDefault()).toInstant().toEpochMilli() }
 
-    suspend fun exchange(scheduleId: String, itemId: String, scheduledAt: Long?, scheduledEndAt: Long?, rewardNote: String): Result<Unit> = runCatching { db.withTransaction {
-        val item = shopDao.item(itemId) ?: error("找不到商品"); check(item.scheduleId == scheduleId && item.active) { "商品未上架" }
-        val card = shopCards(scheduleId).first { it.item.id == itemId }; check(card.unlocked) { "商品尚未解鎖：${card.reason}" }
+    suspend fun exchange(scheduleId: String, itemId: String, scheduledAt: Long?, scheduledEndAt: Long?, rewardNote: String): Result<Unit> = runCatching {
+        exchangeInternal(scheduleId, itemId, scheduledAt, scheduledEndAt, rewardNote, overwriteStrategy = null)
+    }
+
+    /** Exchanges and schedules a reward, replacing conflicting concrete timeline entries if confirmed. */
+    suspend fun exchangeWithOverwrite(scheduleId: String, itemId: String, scheduledAt: Long?, scheduledEndAt: Long?, rewardNote: String, strategy: TimelineOverwriteStrategy): Result<Unit> = runCatching {
+        exchangeInternal(scheduleId, itemId, scheduledAt, scheduledEndAt, rewardNote, overwriteStrategy = strategy)
+    }
+
+    private suspend fun exchangeInternal(
+        scheduleId: String,
+        itemId: String,
+        scheduledAt: Long?,
+        scheduledEndAt: Long?,
+        rewardNote: String,
+        overwriteStrategy: TimelineOverwriteStrategy?
+    ) = db.withTransaction {
+        val item = shopDao.item(itemId) ?: error("找不到商品")
+        check(item.scheduleId == scheduleId && item.active) { "商品未上架" }
+        val card = shopCards(scheduleId).first { it.item.id == itemId }
+        check(card.unlocked) { "商品尚未解鎖：${card.reason}" }
         if (item.limitType != LimitType.UNLIMITED) check(shopDao.exchangeCount(item.id, limitStart(item.limitType)) < item.limitCount) { "已達兌換次數限制" }
-        val old = walletDao.wallet() ?: WalletEntity(); check(old.coins >= item.coinPrice && old.diamonds >= item.diamondPrice) { "貨幣不足" }
-        if (scheduledAt != null && scheduledEndAt != null) { require(scheduledEndAt > scheduledAt) { "獎勵結束時間必須晚於開始時間" }; check(shopDao.overlappingSchedules(scheduledAt, scheduledEndAt).isEmpty()) { "此獎勵時間與另一個已排程獎勵重疊" }; checkRewardTaskConflict(scheduleId, scheduledAt, scheduledEndAt) }
-        val updated = old.copy(coins = old.coins - item.coinPrice, diamonds = old.diamonds - item.diamondPrice, updatedAt = System.currentTimeMillis()); walletDao.save(updated)
+        if (scheduledAt != null || scheduledEndAt != null) {
+            require(scheduledAt != null && scheduledEndAt != null && scheduledEndAt > scheduledAt) { "獎勵結束時間必須晚於開始時間" }
+            val start = Instant.ofEpochMilli(scheduledAt).atZone(ZoneId.systemDefault()).toLocalDateTime()
+            val end = Instant.ofEpochMilli(scheduledEndAt).atZone(ZoneId.systemDefault()).toLocalDateTime()
+            val window = TimelineWindow(start.toLocalDate(), start, end)
+            if (overwriteStrategy == null) checkNoTimelineConflict(scheduleId, window)
+            else applyTimelineOverwrite(scheduleId, window, overwriteStrategy)
+        }
+        val old = walletDao.wallet() ?: WalletEntity()
+        check(old.coins >= item.coinPrice && old.diamonds >= item.diamondPrice) { "貨幣不足" }
+        val updated = old.copy(coins = old.coins - item.coinPrice, diamonds = old.diamonds - item.diamondPrice, updatedAt = System.currentTimeMillis())
+        walletDao.save(updated)
         shopDao.insertExchange(ShopExchangeEntity(shopItemId = item.id, coinCost = item.coinPrice, diamondCost = item.diamondPrice, scheduledAt = scheduledAt, scheduledEndAt = scheduledEndAt, note = rewardNote))
         walletDao.transaction(TransactionEntity(type = TransactionType.SHOP_PURCHASE, coinChange = item.coinPrice.negate(), diamondChange = item.diamondPrice.negate(), coinsBefore = old.coins, coinsAfter = updated.coins, diamondsBefore = old.diamonds, diamondsAfter = updated.diamonds, relatedShopItemId = item.id, scheduleId = scheduleId, note = "兌換：${item.name}${if (rewardNote.isBlank()) "" else "｜$rewardNote"}"))
-    } }
+    }
     suspend fun updateRewardInstance(exchangeId: String, scheduledAt: Long?, scheduledEndAt: Long?, note: String) = db.withTransaction { val exchange = shopDao.exchange(exchangeId) ?: error("找不到獎勵實例"); if (scheduledAt != null && scheduledEndAt != null) require(scheduledEndAt > scheduledAt) { "結束時間必須晚於開始時間" }; shopDao.updateExchange(exchange.copy(scheduledAt = scheduledAt, scheduledEndAt = scheduledEndAt, note = note)) }
     suspend fun deleteRewardInstance(exchangeId: String) = db.withTransaction { val exchange = shopDao.exchange(exchangeId) ?: error("找不到獎勵實例"); val item = shopDao.item(exchange.shopItemId); val old = walletDao.wallet() ?: WalletEntity(); val updated = old.copy(coins = old.coins + exchange.coinCost, diamonds = old.diamonds + exchange.diamondCost, updatedAt = System.currentTimeMillis()); shopDao.deleteExchange(exchange); walletDao.save(updated); walletDao.transaction(TransactionEntity(type = TransactionType.MANUAL_ADJUSTMENT, coinChange = exchange.coinCost, diamondChange = exchange.diamondCost, coinsBefore = old.coins, coinsAfter = updated.coins, diamondsBefore = old.diamonds, diamondsAfter = updated.diamonds, relatedShopItemId = exchange.shopItemId, scheduleId = item?.scheduleId ?: DEFAULT_SCHEDULE_ID, note = "取消獎勵實例，退回貨幣")) }
 
+    /** Library tasks have no overwrite action, so any timed collision remains an error. */
     private suspend fun checkTaskConflict(candidate: TaskEntity) {
-        if (candidate.allDay || candidate.startTime.isBlank() || candidate.endTime.isBlank()) return
-        val day = LocalDate.parse(candidate.startDate); val start = LocalTime.parse(candidate.startTime); val end = parseEndTime(candidate.endTime)
-        ensure(day, candidate.scheduleId)
-        val hasConflict = taskDao.instancesForDate(day.toString()).any { instance ->
-            if (instance.deleted || instance.taskId == candidate.id) return@any false
-            val template = taskDao.task(instance.taskId) ?: return@any false
-            if (template.scheduleId != candidate.scheduleId) return@any false
-            val effective = effectiveTask(template, instance)
-            !effective.allDay && effective.startTime.isNotBlank() && effective.endTime.isNotBlank() &&
-                start < parseEndTime(effective.endTime) && LocalTime.parse(effective.startTime) < end
-        }
-        check(!hasConflict) { "此時間與既有任務重疊" }
+        candidate.timedWindowOrNull()?.let { window -> checkNoTimelineConflict(candidate.scheduleId, window, candidate.id) }
     }
-    private suspend fun checkRewardTaskConflict(scheduleId: String, startAt: Long, endAt: Long) {
-        val zone = ZoneId.systemDefault(); val day = Instant.ofEpochMilli(startAt).atZone(zone).toLocalDate(); val start = Instant.ofEpochMilli(startAt).atZone(zone).toLocalTime(); val end = Instant.ofEpochMilli(endAt).atZone(zone).toLocalTime()
-        check(!taskDao.activeTasks(scheduleId).filter { occurs(it, day) && !it.allDay && it.startTime.isNotBlank() && it.endTime.isNotBlank() }.any { start < parseEndTime(it.endTime) && LocalTime.parse(it.startTime) < end }) { "此獎勵時間與任務重疊" }
+
+    private fun TaskEntity.timedWindowOrNull(): TimelineWindow? =
+        if (allDay || startTime.isBlank() || endTime.isBlank()) null else timedWindow(startDate, startTime, endTime)
+
+    private fun timedWindow(date: String, startText: String, endText: String): TimelineWindow {
+        val day = LocalDate.parse(date)
+        val startTime = LocalTime.parse(startText)
+        val start = day.atTime(startTime)
+        val end = if (endText == "24:00") day.plusDays(1).atStartOfDay() else day.atTime(LocalTime.parse(endText))
+        require(end.isAfter(start)) { "結束時間必須晚於開始時間" }
+        return TimelineWindow(day, start, end)
+    }
+
+    private suspend fun checkNoTimelineConflict(scheduleId: String, window: TimelineWindow, excludeTaskId: String? = null, excludeInstanceId: String? = null) {
+        val conflicts = collectTimelineConflicts(scheduleId, window, excludeTaskId, excludeInstanceId)
+        check(conflicts.tasks.isEmpty() && conflicts.rewards.isEmpty() && conflicts.protectedTasks.isEmpty()) {
+            "此時間與既有日程重疊；任務庫建立的任務不可覆寫其他日程"
+        }
+    }
+
+    private suspend fun collectTimelineConflicts(
+        scheduleId: String,
+        window: TimelineWindow,
+        excludeTaskId: String? = null,
+        excludeInstanceId: String? = null
+    ): TimelineConflicts {
+        ensure(window.day, scheduleId)
+        val tasks = mutableListOf<TaskTimelineConflict>()
+        val protected = mutableListOf<TaskTimelineConflict>()
+        taskDao.instancesForDate(window.day.toString()).forEach { instance ->
+            if (instance.deleted || instance.taskId == excludeTaskId || instance.id == excludeInstanceId) return@forEach
+            val template = taskDao.task(instance.taskId) ?: return@forEach
+            if (template.scheduleId != scheduleId) return@forEach
+            val effective = effectiveTask(template, instance)
+            if (effective.allDay || effective.startTime.isBlank() || effective.endTime.isBlank()) return@forEach
+            val itemStart = runCatching { window.day.atTime(LocalTime.parse(effective.startTime)) }.getOrNull() ?: return@forEach
+            val itemEnd = runCatching {
+                if (effective.endTime == "24:00") window.day.plusDays(1).atStartOfDay()
+                else window.day.atTime(LocalTime.parse(effective.endTime))
+            }.getOrNull() ?: return@forEach
+            if (!window.start.isBefore(itemEnd) || !itemStart.isBefore(window.end)) return@forEach
+            val conflict = TaskTimelineConflict(
+                template = template,
+                instance = instance,
+                effective = effective,
+                start = itemStart,
+                end = itemEnd,
+                fullyCovered = !window.start.isAfter(itemStart) && !window.end.isBefore(itemEnd)
+            )
+            if (instance.settled) protected += conflict else tasks += conflict
+        }
+
+        val candidateStart = window.start.atZone(ZoneId.systemDefault()).toInstant()
+        val candidateEnd = window.end.atZone(ZoneId.systemDefault()).toInstant()
+        val rewards = shopDao.overlappingSchedules(candidateStart.toEpochMilli(), candidateEnd.toEpochMilli()).mapNotNull { exchange ->
+            val item = shopDao.item(exchange.shopItemId) ?: return@mapNotNull null
+            if (item.scheduleId != scheduleId) return@mapNotNull null
+            val itemStart = exchange.scheduledAt?.let(Instant::ofEpochMilli) ?: return@mapNotNull null
+            val itemEnd = exchange.scheduledEndAt?.let(Instant::ofEpochMilli) ?: itemStart
+            RewardTimelineConflict(
+                item = item,
+                exchange = exchange,
+                start = itemStart,
+                end = itemEnd,
+                fullyCovered = !candidateStart.isAfter(itemStart) && !candidateEnd.isBefore(itemEnd)
+            )
+        }
+        return TimelineConflicts(tasks = tasks, rewards = rewards, protectedTasks = protected)
+    }
+
+    /** Applies the already-previewed overwrite again inside the write transaction to avoid stale conflicts. */
+    private suspend fun applyTimelineOverwrite(scheduleId: String, window: TimelineWindow, strategy: TimelineOverwriteStrategy) {
+        val conflicts = collectTimelineConflicts(scheduleId, window)
+        check(conflicts.protectedTasks.isEmpty()) { "已結算的任務會保留紀錄，無法被覆寫" }
+        conflicts.tasks.forEach { conflict ->
+            if (conflict.fullyCovered || strategy == TimelineOverwriteStrategy.REMOVE_PARTIAL_TASKS) {
+                removeTaskInstanceForOverwrite(conflict)
+            } else {
+                trimTaskInstanceForOverwrite(conflict, window)
+            }
+        }
+        for (reward in conflicts.rewards) refundRewardForOverwrite(reward)
+    }
+
+    private suspend fun removeTaskInstanceForOverwrite(conflict: TaskTimelineConflict) {
+        if (conflict.template.timelineOnly) {
+            taskDao.deleteInstancesForTask(conflict.template.id)
+            taskDao.delete(conflict.template)
+        } else {
+            taskDao.updateInstance(conflict.instance.copy(deleted = true))
+        }
+    }
+
+    /**
+     * Keeps the portions of an unfinished task outside the proposed window.
+     * If the new item cuts through the middle, the later portion becomes a
+     * detached one-off continuation so a recurring task definition is never
+     * modified.
+     */
+    private suspend fun trimTaskInstanceForOverwrite(conflict: TaskTimelineConflict, window: TimelineWindow) {
+        val keepBefore = conflict.start.isBefore(window.start)
+        val keepAfter = window.end.isBefore(conflict.end)
+        if (!keepBefore && !keepAfter) {
+            removeTaskInstanceForOverwrite(conflict)
+            return
+        }
+        val totalMinutes = ChronoUnit.MINUTES.between(conflict.start, conflict.end).coerceAtLeast(1)
+        val beforeMinutes = if (keepBefore) ChronoUnit.MINUTES.between(conflict.start, window.start).coerceAtLeast(0) else 0
+        val afterMinutes = if (keepAfter) ChronoUnit.MINUTES.between(window.end, conflict.end).coerceAtLeast(0) else 0
+        val retainedCoins = proportionalReward(conflict.effective.rewardCoins, beforeMinutes + afterMinutes, totalMinutes)
+        val retainedDiamonds = proportionalReward(conflict.effective.rewardDiamonds, beforeMinutes + afterMinutes, totalMinutes)
+        val beforeCoins = proportionalReward(conflict.effective.rewardCoins, beforeMinutes, totalMinutes)
+        val beforeDiamonds = proportionalReward(conflict.effective.rewardDiamonds, beforeMinutes, totalMinutes)
+        val afterCoins = retainedCoins - beforeCoins
+        val afterDiamonds = retainedDiamonds - beforeDiamonds
+
+        val primaryStart = if (keepBefore) conflict.start else window.end
+        val primaryEnd = if (keepBefore) window.start else conflict.end
+        val primaryCoins = if (keepBefore) beforeCoins else afterCoins
+        val primaryDiamonds = if (keepBefore) beforeDiamonds else afterDiamonds
+        taskDao.updateInstance(conflict.instance.copy(
+            startTimeOverride = timelineTime(conflict.instance.scheduledDate, primaryStart),
+            endTimeOverride = timelineTime(conflict.instance.scheduledDate, primaryEnd),
+            rewardCoinsOverride = primaryCoins,
+            rewardDiamondsOverride = primaryDiamonds
+        ))
+
+        if (keepBefore && keepAfter) {
+            val continuation = conflict.effective.copy(
+                id = UUID.randomUUID().toString(),
+                startDate = conflict.instance.scheduledDate,
+                startTime = timelineTime(conflict.instance.scheduledDate, window.end),
+                endTime = timelineTime(conflict.instance.scheduledDate, conflict.end),
+                repeatType = RepeatType.NONE,
+                repeatConfig = "",
+                repeatEndDate = "",
+                timelineOnly = true,
+                puzzleId = null,
+                puzzleEntryId = null,
+                puzzleBaseAt = null,
+                rewardCoins = afterCoins,
+                rewardDiamonds = afterDiamonds,
+                createdAt = System.currentTimeMillis(),
+                updatedAt = System.currentTimeMillis()
+            )
+            taskDao.upsert(continuation)
+            taskDao.insertInstance(TaskInstanceEntity(taskId = continuation.id, scheduledDate = continuation.startDate))
+        }
+    }
+
+    private fun proportionalReward(amount: BigDecimal, keptMinutes: Long, totalMinutes: Long): BigDecimal =
+        if (keptMinutes <= 0) BigDecimal.ZERO
+        else amount.multiply(BigDecimal(keptMinutes)).divide(BigDecimal(totalMinutes), 2, RoundingMode.HALF_UP)
+
+    private fun timelineTime(dayText: String, value: LocalDateTime): String {
+        val day = LocalDate.parse(dayText)
+        return if (value == day.plusDays(1).atStartOfDay()) "24:00" else value.toLocalTime().toString().take(5)
+    }
+
+    private suspend fun refundRewardForOverwrite(conflict: RewardTimelineConflict) {
+        val old = walletDao.wallet() ?: WalletEntity()
+        val updated = old.copy(
+            coins = old.coins + conflict.exchange.coinCost,
+            diamonds = old.diamonds + conflict.exchange.diamondCost,
+            updatedAt = System.currentTimeMillis()
+        )
+        shopDao.deleteExchange(conflict.exchange)
+        walletDao.save(updated)
+        walletDao.transaction(TransactionEntity(
+            type = TransactionType.MANUAL_ADJUSTMENT,
+            coinChange = conflict.exchange.coinCost,
+            diamondChange = conflict.exchange.diamondCost,
+            coinsBefore = old.coins,
+            coinsAfter = updated.coins,
+            diamondsBefore = old.diamonds,
+            diamondsAfter = updated.diamonds,
+            relatedShopItemId = conflict.exchange.shopItemId,
+            scheduleId = conflict.item.scheduleId,
+            note = "覆寫獎勵日程，退回貨幣：${conflict.item.name}"
+        ))
     }
     suspend fun adjust(scheduleId: String, coins: BigDecimal, diamonds: BigDecimal, note: String) = db.withTransaction { val old = walletDao.wallet() ?: WalletEntity(); val updated = old.copy(coins = old.coins + coins, diamonds = old.diamonds + diamonds, updatedAt = System.currentTimeMillis()); require(updated.coins >= BigDecimal.ZERO && updated.diamonds >= BigDecimal.ZERO) { "調整後貨幣不可小於 0" }; walletDao.save(updated); walletDao.transaction(TransactionEntity(type = TransactionType.MANUAL_ADJUSTMENT, coinChange = coins, diamondChange = diamonds, coinsBefore = old.coins, coinsAfter = updated.coins, diamondsBefore = old.diamonds, diamondsAfter = updated.diamonds, scheduleId = scheduleId, note = note)) }
 
