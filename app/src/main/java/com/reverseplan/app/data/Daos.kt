@@ -6,7 +6,7 @@ import kotlinx.coroutines.flow.Flow
 @Dao
 interface TaskDao {
     @Query("SELECT * FROM tasks WHERE scheduleId = :scheduleId AND timelineOnly = 0 ORDER BY active DESC, createdAt DESC") fun observeTasks(scheduleId: String): Flow<List<TaskEntity>>
-    @Query("SELECT * FROM tasks WHERE scheduleId = :scheduleId AND active = 1") suspend fun activeTasks(scheduleId: String): List<TaskEntity>
+    @Query("SELECT * FROM tasks WHERE scheduleId = :scheduleId AND active = 1 ORDER BY createdAt ASC") suspend fun activeTasks(scheduleId: String): List<TaskEntity>
     @Query("SELECT * FROM tasks WHERE scheduleId = :scheduleId") suspend fun tasksForSchedule(scheduleId: String): List<TaskEntity>
     @Query("SELECT * FROM tasks WHERE puzzleId = :puzzleId") suspend fun tasksForPuzzle(puzzleId: String): List<TaskEntity>
     @Query("SELECT * FROM tasks WHERE id = :id") suspend fun task(id: String): TaskEntity?

@@ -33,7 +33,10 @@ import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.zIndex
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.core.content.ContextCompat
@@ -998,7 +1001,14 @@ private fun TaskLibrary(state: MissionUiState, vm: MissionViewModel) {
             previewTimelineOverwrite = { date, start, end, onReady, onFailure ->
                 vm.previewTimelineOverwrite(date, start, end, onReady, onFailure)
             },
-            save = { task -> vm.saveTask(task); creatingInitial = null }
+            previewTaskLibrarySchedule = { task, days, onReady, onFailure ->
+                vm.previewTaskLibrarySchedule(task, days, onReady, onFailure)
+            },
+            save = { task -> vm.saveTask(task); creatingInitial = null },
+            overwrite = { task, strategy ->
+                vm.saveTaskWithOverwrite(task, strategy)
+                creatingInitial = null
+            }
         )
     }
     editing?.let { task ->
@@ -1011,7 +1021,14 @@ private fun TaskLibrary(state: MissionUiState, vm: MissionViewModel) {
             previewTimelineOverwrite = { date, start, end, onReady, onFailure ->
                 vm.previewTimelineOverwrite(date, start, end, onReady, onFailure, excludeTaskId = task.id)
             },
+            previewTaskLibrarySchedule = { updated, days, onReady, onFailure ->
+                vm.previewTaskLibrarySchedule(updated, days, onReady, onFailure)
+            },
             save = { updated -> vm.saveTask(updated); editing = null },
+            overwrite = { updated, strategy ->
+                vm.saveTaskWithOverwrite(updated, strategy)
+                editing = null
+            },
             delete = { vm.deleteTask(task); editing = null }
         )
     }
@@ -1090,6 +1107,7 @@ private fun TaskFormDialog(
     dismiss: () -> Unit,
     save: (TaskEntity) -> Unit,
     previewTimelineOverwrite: ((String, String, String, (TimelineOverwritePreview) -> Unit, (String) -> Unit) -> Unit)? = null,
+    previewTaskLibrarySchedule: ((TaskEntity, Int, (TaskLibrarySchedulePreview) -> Unit, (String) -> Unit) -> Unit)? = null,
     overwrite: ((TaskEntity, TimelineOverwriteStrategy) -> Unit)? = null,
     delete: (() -> Unit)? = null
 ) {
@@ -1121,9 +1139,14 @@ private fun TaskFormDialog(
     var overwritePreviewKey by remember(initial.id) { mutableStateOf("") }
     var overwritePreviewError by remember(initial.id) { mutableStateOf<String?>(null) }
     var pendingOverwrite by remember(initial.id) { mutableStateOf<TaskEntity?>(null) }
+    var librarySchedulePreview by remember(initial.id) { mutableStateOf<TaskLibrarySchedulePreview?>(null) }
+    var librarySchedulePreviewError by remember(initial.id) { mutableStateOf<String?>(null) }
+    var showingLibraryPreview by remember(initial.id) { mutableStateOf(false) }
+    var showingSkippedOccurrences by remember(initial.id) { mutableStateOf(false) }
+    var libraryPreviewDays by remember(initial.id) { mutableIntStateOf(60) }
     val currentTimeKey = "$date|$start|$end"
-    val needsOverwritePreview = previewTimelineOverwrite != null && !allDay && date.length == 10 && start.length == 5 && end.length == 5
-    LaunchedEffect(date, start, end, allDay, previewTimelineOverwrite != null) {
+    val needsOverwritePreview = previewTimelineOverwrite != null && repeat == RepeatType.NONE && !allDay && date.length == 10 && start.length == 5 && end.length == 5
+    LaunchedEffect(date, start, end, allDay, repeat, previewTimelineOverwrite != null) {
         overwritePreview = null
         overwritePreviewKey = ""
         overwritePreviewError = null
@@ -1163,21 +1186,51 @@ private fun TaskFormDialog(
             repeatEndDate = if (repeat == RepeatType.NONE) "" else repeatEndDate
         )
     }
+    val canPreviewLibrarySchedule = previewTaskLibrarySchedule != null && !allDay && date.length == 10 && start.length == 5 && end.length == 5
+    LaunchedEffect(showingLibraryPreview, libraryPreviewDays) {
+        if (showingLibraryPreview) {
+            librarySchedulePreview = null
+            librarySchedulePreviewError = null
+            previewTaskLibrarySchedule?.invoke(draftTask(), libraryPreviewDays, { result ->
+                librarySchedulePreview = result
+            }, { error -> librarySchedulePreviewError = error })
+        }
+    }
     AlertDialog(
         onDismissRequest = dismiss,
+        modifier = Modifier.widthIn(min = 340.dp),
         title = { Text(title) },
         text = {
             Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Field("任務名稱", name) { name = it }
+                Field("任務名稱", name, required = true) { name = it }
                 Field("描述", description) { description = it }
-                Field("日期 YYYY-MM-DD", date) { date = it }
+                Field("日期 YYYY-MM-DD", date, required = true) { date = it }
                 if (!allDay) Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Field("開始 HH:mm", start, Modifier.weight(1f)) { start = it }
-                    Field("結束 HH:mm", end, Modifier.weight(1f)) { end = it }
+                    Field("開始HH:mm", start, Modifier.weight(1f), required = true) { start = it }
+                    Field("結束HH:mm", end, Modifier.weight(1f), required = true) { end = it }
                 }
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Checkbox(allDay, { allDay = it })
                     Text("全天任務")
+                }
+                if (allowRepeat) {
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Text("重複週期", fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                        if (canPreviewLibrarySchedule && repeat != RepeatType.NONE) {
+                            TextButton(
+                                onClick = { showingLibraryPreview = true },
+                                contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp)
+                            ) { Text("查詢衝突任務", color = MaterialTheme.colorScheme.primary) }
+                        }
+                    }
+                    RepeatPicker(repeat) { repeat = it }
+                    if (repeat != RepeatType.NONE) Field("結束日期 YYYY-MM-DD（選填）", repeatEndDate) { repeatEndDate = it }
+                    when (repeat) {
+                        RepeatType.WEEKLY -> WeekdayPicker(weekDays) { weekDays = it }
+                        RepeatType.INTERVAL -> Field("每隔幾天", intervalDays) { intervalDays = it.filter(Char::isDigit) }
+                        RepeatType.MONTHLY -> Field("每月日期（1-31 或 last）", monthDay) { monthDay = it }
+                        else -> Unit
+                    }
                 }
                 if (previewTimelineOverwrite != null && needsOverwritePreview) {
                     TimelineOverwritePreviewHint(activeOverwritePreview, overwritePreviewError, allowOverwrite = overwrite != null)
@@ -1192,27 +1245,15 @@ private fun TaskFormDialog(
                 CategoryPicker(categories, categoryId) { categoryId = it }
                 Text("重要程度（以卡片外框顏色標示）", fontWeight = FontWeight.Bold)
                 PriorityPicker(priority) { priority = it }
-                if (allowRepeat) {
-                    Text("重複週期", fontWeight = FontWeight.Bold)
-                    RepeatPicker(repeat) { repeat = it }
-                    if (repeat != RepeatType.NONE) Field("重複結束日期 YYYY-MM-DD（選填）", repeatEndDate) { repeatEndDate = it }
-                    when (repeat) {
-                        RepeatType.WEEKLY -> WeekdayPicker(weekDays) { weekDays = it }
-                        RepeatType.INTERVAL -> Field("每隔幾天", intervalDays) { intervalDays = it.filter(Char::isDigit) }
-                        RepeatType.MONTHLY -> Field("每月日期（1-31 或 last）", monthDay) { monthDay = it }
-                        else -> Unit
-                    }
-                }
                 Text("檢查清單（每行一個項目）", fontWeight = FontWeight.Bold)
                 Field("檢查清單", checklist) { checklist = it }
             }
         },
         confirmButton = {
             Button(
-                enabled = name.isNotBlank() &&
+                enabled = name.isNotBlank() && date.length == 10 && (allDay || (start.length == 5 && end.length == 5)) &&
                     (!needsOverwritePreview || activeOverwritePreview != null) &&
-                    activeOverwritePreview?.hasBlockingConflicts != true &&
-                    (overwrite != null || activeOverwritePreview?.hasOverwritableConflicts != true),
+                    activeOverwritePreview?.hasBlockingConflicts != true,
                 onClick = {
                     val task = draftTask()
                     if (activeOverwritePreview?.hasOverwritableConflicts == true && overwrite != null) pendingOverwrite = task
@@ -1239,6 +1280,44 @@ private fun TaskFormDialog(
                 overwrite?.invoke(task, strategy) ?: save(task)
             }
         )
+    }
+    if (showingLibraryPreview) AlertDialog(
+        onDismissRequest = { showingLibraryPreview = false },
+        title = { Text("任務衝突預覽") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("這只會查詢，不會影響任務儲存或既有日程。", color = Color.Gray, style = MaterialTheme.typography.bodySmall)
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth()) {
+                    listOf(60, 180, 365).forEach { days ->
+                        FilterChip(
+                            selected = libraryPreviewDays == days,
+                            onClick = { libraryPreviewDays = days },
+                            label = { Text("$days 天") },
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                }
+                TaskLibrarySchedulePreviewHint(librarySchedulePreview, librarySchedulePreviewError) {
+                    showingSkippedOccurrences = true
+                }
+            }
+        },
+        confirmButton = { TextButton({ showingLibraryPreview = false }) { Text("關閉") } }
+    )
+    if (showingSkippedOccurrences) {
+        val preview = librarySchedulePreview
+        if (preview != null) AlertDialog(
+            onDismissRequest = { showingSkippedOccurrences = false },
+            title = { Text("未排入時間軸的實例") },
+            text = {
+                LazyColumn(Modifier.heightIn(max = 360.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    items(preview.skippedOccurrences, key = { it.date }) { occurrence ->
+                        Text("${occurrence.date}：${occurrence.conflicts.joinToString("、")}", style = MaterialTheme.typography.bodySmall)
+                    }
+                }
+            },
+            confirmButton = { TextButton({ showingSkippedOccurrences = false }) { Text("關閉") } }
+        ) else showingSkippedOccurrences = false
     }
 }
 
@@ -1277,6 +1356,35 @@ private fun TimelineOverwritePreviewHint(preview: TimelineOverwritePreview?, err
             (preview.fullyCoveredRewards + preview.partiallyOverlappedRewards).takeIf { it.isNotEmpty() }?.let {
                 Text("衝突獎勵：${it.joinToString("、") { target -> target.overwriteLabel() }}", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall)
             }
+        }
+    }
+}
+
+/** Preview for task-library definitions: conflicts skip only the affected occurrences. */
+@Composable
+private fun TaskLibrarySchedulePreviewHint(
+    preview: TaskLibrarySchedulePreview?,
+    error: String?,
+    showDetails: () -> Unit
+) {
+    when {
+        error != null -> Text(error, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall)
+        preview == null -> Text("正在預覽可排入的任務實例…", color = Color.Gray, style = MaterialTheme.typography.labelSmall)
+        preview.skippedOccurrences.isEmpty() -> {
+            Text(
+                "預覽至 ${preview.examinedThrough}：所有任務實例都可排入時間軸。",
+                color = Color(0xFF2EAD74),
+                style = MaterialTheme.typography.labelSmall
+            )
+        }
+        else -> Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text(
+                "${preview.skippedOccurrences.size} 個實例與既有日程重疊，不會排入時間軸：${preview.skippedOccurrences.take(3).joinToString("、") { it.date }}${if (preview.skippedOccurrences.size > 3) "…" else ""}",
+                color = MaterialTheme.colorScheme.error,
+                style = MaterialTheme.typography.labelSmall
+            )
+            if (preview.limitedToPreviewWindow) Text("此預覽僅顯示所選範圍；之後的實例仍會依相同規則檢查。", color = Color.Gray, style = MaterialTheme.typography.labelSmall)
+            if (preview.skippedOccurrences.size > 3) TextButton(onClick = showDetails, contentPadding = PaddingValues(0.dp)) { Text("查看詳細") }
         }
     }
 }
@@ -1542,14 +1650,29 @@ private fun RewardInstanceEditDialog(
 }
 
 @Composable
-private fun Field(label: String, value: String, modifier: Modifier = Modifier.fillMaxWidth(), set: (String) -> Unit) {
+private fun Field(
+    label: String,
+    value: String,
+    modifier: Modifier = Modifier.fillMaxWidth(),
+    required: Boolean = false,
+    set: (String) -> Unit
+) {
     OutlinedTextField(
         value = value,
         onValueChange = { raw ->
             val digits = raw.filter(Char::isDigit)
             set(if (label.contains("HH:mm") && digits.length == 4 && ':' !in raw) digits.take(2) + ":" + digits.drop(2) else raw)
         },
-        label = { Text(label) },
+        label = {
+            Text(
+                text = buildAnnotatedString {
+                    append(label)
+                    if (required) withStyle(SpanStyle(color = MaterialTheme.colorScheme.error)) { append(" *") }
+                },
+                maxLines = 1,
+                softWrap = false
+            )
+        },
         modifier = modifier,
         singleLine = !label.contains("描述") && !label.contains("清單") && !label.contains("心得") && !label.contains("總結"),
         minLines = if (label.contains("描述") || label.contains("清單") || label.contains("心得") || label.contains("總結")) 3 else 1

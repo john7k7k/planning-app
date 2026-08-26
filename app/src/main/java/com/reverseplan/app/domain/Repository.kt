@@ -87,6 +87,14 @@ data class TimelineOverwritePreview(
     val hasBlockingConflicts: Boolean get() = protectedTasks.isNotEmpty()
 }
 
+/** A future occurrence from a task-library definition that is intentionally not placed on the timeline. */
+data class SkippedTaskOccurrence(val date: String, val conflicts: List<String>)
+data class TaskLibrarySchedulePreview(
+    val skippedOccurrences: List<SkippedTaskOccurrence>,
+    val examinedThrough: String,
+    val limitedToPreviewWindow: Boolean
+)
+
 private data class TimelineWindow(val day: LocalDate, val start: LocalDateTime, val end: LocalDateTime)
 private data class TaskTimelineConflict(
     val template: TaskEntity,
@@ -108,6 +116,21 @@ private data class TimelineConflicts(
     val rewards: List<RewardTimelineConflict>,
     val protectedTasks: List<TaskTimelineConflict>
 )
+
+private fun hasScheduleOverride(instance: TaskInstanceEntity): Boolean =
+    instance.deleted ||
+        instance.startTimeOverride != null || instance.endTimeOverride != null ||
+        instance.nameOverride != null || instance.descriptionOverride != null ||
+        instance.locationOverride != null || instance.addressOverride != null ||
+        instance.allDayOverride != null || instance.rewardCoinsOverride != null ||
+        instance.rewardDiamondsOverride != null || instance.categoryIdOverride != null ||
+        instance.priorityOverride != null || instance.checklistOverride != null
+
+private fun JSONObject.optionalString(name: String): String? =
+    if (!has(name) || isNull(name)) null else getString(name)
+
+private fun JSONObject.optionalBoolean(name: String): Boolean? =
+    if (!has(name) || isNull(name)) null else getBoolean(name)
 
 class MissionRepository(private val db: AppDatabase) {
     private val taskDao = db.taskDao()
@@ -210,6 +233,19 @@ class MissionRepository(private val db: AppDatabase) {
                 put("name", item.name); put("emoji", item.emoji); put("description", item.description)
                 put("coinPrice", item.coinPrice.toPlainString()); put("diamondPrice", item.diamondPrice.toPlainString()); put("sortOrder", item.sortOrder)
             } }))
+            val instanceOverrides = exportedTasks.flatMap { taskDao.instancesForTask(it.id) }
+                .filter(::hasScheduleOverride)
+            put("instanceOverrides", JSONArray(instanceOverrides.map { instance -> JSONObject().apply {
+                put("taskId", instance.taskId); put("scheduledDate", instance.scheduledDate); put("deleted", instance.deleted)
+                put("startTimeOverride", instance.startTimeOverride ?: JSONObject.NULL); put("endTimeOverride", instance.endTimeOverride ?: JSONObject.NULL)
+                put("nameOverride", instance.nameOverride ?: JSONObject.NULL); put("descriptionOverride", instance.descriptionOverride ?: JSONObject.NULL)
+                put("locationOverride", instance.locationOverride ?: JSONObject.NULL); put("addressOverride", instance.addressOverride ?: JSONObject.NULL)
+                put("allDayOverride", instance.allDayOverride ?: JSONObject.NULL)
+                put("rewardCoinsOverride", instance.rewardCoinsOverride?.toPlainString() ?: JSONObject.NULL)
+                put("rewardDiamondsOverride", instance.rewardDiamondsOverride?.toPlainString() ?: JSONObject.NULL)
+                put("categoryIdOverride", instance.categoryIdOverride ?: JSONObject.NULL); put("priorityOverride", instance.priorityOverride?.name ?: JSONObject.NULL)
+                put("checklistOverride", instance.checklistOverride ?: JSONObject.NULL)
+            } }))
             if (includeCompletionData) {
                 val completedInstances = exportedTasks.flatMap { taskDao.instancesForTask(it.id) }
                     .filter { it.settled || it.result.isNotBlank() }
@@ -255,7 +291,7 @@ class MissionRepository(private val db: AppDatabase) {
             val importedTask = TaskEntity(
                 name = task.optString("name", "未命名任務"), description = task.optString("description"),
                 startDate = task.optString("startDate", LocalDate.now().toString()), startTime = task.optString("startTime"), endTime = task.optString("endTime"),
-                allDay = task.optBoolean("allDay", true), repeatType = runCatching { RepeatType.valueOf(task.optString("repeatType", "NONE")) }.getOrDefault(RepeatType.NONE),
+                allDay = task.optBoolean("allDay", false), repeatType = runCatching { RepeatType.valueOf(task.optString("repeatType", "NONE")) }.getOrDefault(RepeatType.NONE),
                 repeatConfig = task.optString("repeatConfig"), repeatEndDate = task.optString("repeatEndDate"), categoryId = categoryId,
                 priority = runCatching { TaskPriority.valueOf(task.optString("priority", "NONE")) }.getOrDefault(TaskPriority.NONE), checklist = task.optString("checklist"),
                 timelineOnly = task.optBoolean("timelineOnly", false),
@@ -264,6 +300,28 @@ class MissionRepository(private val db: AppDatabase) {
             )
             taskDao.upsert(importedTask)
             task.optString("id").takeIf { it.isNotBlank() }?.let { taskIdMap[it] = importedTask.id }
+        }
+        val instanceOverrides = source.optJSONArray("instanceOverrides") ?: JSONArray()
+        for (i in 0 until instanceOverrides.length()) {
+            val sourceInstance = instanceOverrides.getJSONObject(i)
+            val taskId = taskIdMap[sourceInstance.optString("taskId")] ?: continue
+            taskDao.insertInstance(TaskInstanceEntity(
+                taskId = taskId,
+                scheduledDate = sourceInstance.optString("scheduledDate", LocalDate.now().toString()),
+                deleted = sourceInstance.optBoolean("deleted", false),
+                startTimeOverride = sourceInstance.optionalString("startTimeOverride"),
+                endTimeOverride = sourceInstance.optionalString("endTimeOverride"),
+                nameOverride = sourceInstance.optionalString("nameOverride"),
+                descriptionOverride = sourceInstance.optionalString("descriptionOverride"),
+                locationOverride = sourceInstance.optionalString("locationOverride"),
+                addressOverride = sourceInstance.optionalString("addressOverride"),
+                allDayOverride = sourceInstance.optionalBoolean("allDayOverride"),
+                rewardCoinsOverride = sourceInstance.optionalString("rewardCoinsOverride")?.toBigDecimalOrNull(),
+                rewardDiamondsOverride = sourceInstance.optionalString("rewardDiamondsOverride")?.toBigDecimalOrNull(),
+                categoryIdOverride = sourceInstance.optionalString("categoryIdOverride")?.let { categoryMap[it] ?: defaultCategoryId(schedule.id, "other") },
+                priorityOverride = sourceInstance.optionalString("priorityOverride")?.let { value -> runCatching { TaskPriority.valueOf(value) }.getOrNull() },
+                checklistOverride = sourceInstance.optionalString("checklistOverride")
+            ))
         }
         val items = source.optJSONArray("shopItems") ?: JSONArray()
         for (i in 0 until items.length()) {
@@ -274,9 +332,12 @@ class MissionRepository(private val db: AppDatabase) {
         for (i in 0 until completionData.length()) {
             val completion = completionData.getJSONObject(i)
             val taskId = taskIdMap[completion.optString("taskId")] ?: continue
-            val importedInstance = TaskInstanceEntity(
+            val scheduledDate = completion.optString("scheduledDate", LocalDate.now().toString())
+            val existingInstance = taskDao.instance(taskId, scheduledDate)
+            val importedInstance = (existingInstance ?: TaskInstanceEntity(
                 taskId = taskId,
-                scheduledDate = completion.optString("scheduledDate", LocalDate.now().toString()),
+                scheduledDate = scheduledDate
+            )).copy(
                 completionPercentage = completion.optString("completionPercentage", "0").toBigDecimalOrNull() ?: BigDecimal.ZERO,
                 result = completion.optString("result"),
                 status = runCatching { TaskStatus.valueOf(completion.optString("status", "NOT_STARTED")) }.getOrDefault(TaskStatus.NOT_STARTED),
@@ -286,7 +347,7 @@ class MissionRepository(private val db: AppDatabase) {
                 settledAt = if (completion.isNull("settledAt")) null else completion.optLong("settledAt"),
                 checkedChecklistItems = completion.optString("checkedChecklistItems")
             )
-            taskDao.insertInstance(importedInstance)
+            if (existingInstance == null) taskDao.insertInstance(importedInstance) else taskDao.updateInstance(importedInstance)
             if (importedInstance.settled) {
                 val oldWallet = walletDao.wallet() ?: WalletEntity()
                 val updatedWallet = oldWallet.copy(
@@ -560,7 +621,7 @@ class MissionRepository(private val db: AppDatabase) {
     }
 
     suspend fun saveTask(task: TaskEntity, prerequisiteIds: List<String> = emptyList(), minimums: Map<String, BigDecimal> = emptyMap()) = db.withTransaction {
-        validateTask(task); checkTaskConflict(task)
+        validateTask(task)
         require(prerequisiteIds.none { it == task.id || createsCycle(task.id, it) }) { "前置任務不可形成循環" }
         taskDao.upsert(task.copy(timelineOnly = false, updatedAt = System.currentTimeMillis()))
         if (prerequisiteIds.isNotEmpty()) {
@@ -583,6 +644,23 @@ class MissionRepository(private val db: AppDatabase) {
         validateTask(event)
         event.timedWindowOrNull()?.let { applyTimelineOverwrite(event.scheduleId, it, strategy) }
         taskDao.upsert(event)
+        taskDao.insertInstance(TaskInstanceEntity(taskId = event.id, scheduledDate = event.startDate))
+    }
+
+    /**
+     * A single task created from the task library stays in that library, while its
+     * concrete occurrence can use the same overwrite choices as a timeline-only task.
+     */
+    suspend fun saveTaskWithOverwrite(task: TaskEntity, strategy: TimelineOverwriteStrategy) = db.withTransaction {
+        require(task.repeatType == RepeatType.NONE) { "只有單次任務可覆寫既有日程" }
+        val event = task.copy(timelineOnly = false, repeatType = RepeatType.NONE, repeatConfig = "", repeatEndDate = "", updatedAt = System.currentTimeMillis())
+        validateTask(event)
+        event.timedWindowOrNull()?.let { applyTimelineOverwrite(event.scheduleId, it, strategy, excludeTaskId = event.id) }
+        taskDao.upsert(event)
+        // A moved, unfinished single occurrence should not remain on its old date.
+        taskDao.instancesForTask(event.id)
+            .filter { !it.settled && it.scheduledDate != event.startDate }
+            .forEach { taskDao.updateInstance(it.copy(deleted = true)) }
         taskDao.insertInstance(TaskInstanceEntity(taskId = event.id, scheduledDate = event.startDate))
     }
 
@@ -614,6 +692,48 @@ class MissionRepository(private val db: AppDatabase) {
             fullyCoveredRewards = conflicts.rewards.filter { it.fullyCovered }.map { it.target() },
             partiallyOverlappedRewards = conflicts.rewards.filterNot { it.fullyCovered }.map { it.target() },
             protectedTasks = conflicts.protectedTasks.map { it.target() }
+        )
+    }
+
+    /**
+     * Looks ahead at a task-library definition without changing the timeline.
+     * The requested preview window is shown for open-ended repetition, while a defined
+     * repeat-end date is honoured when it falls sooner.
+     */
+    suspend fun taskLibrarySchedulePreview(candidate: TaskEntity, previewDays: Int = 60): TaskLibrarySchedulePreview {
+        val startDay = LocalDate.parse(candidate.startDate)
+        if (candidate.allDay || candidate.startTime.isBlank() || candidate.endTime.isBlank()) {
+            return TaskLibrarySchedulePreview(emptyList(), startDay.toString(), false)
+        }
+        val safePreviewDays = previewDays.coerceIn(1, 365)
+        val horizon = startDay.plusDays((safePreviewDays - 1).toLong())
+        val activeTasks = taskDao.activeTasks(candidate.scheduleId)
+        val configuredEnd = candidate.repeatEndDate.takeIf { it.isNotBlank() }?.let(LocalDate::parse)
+            ?: if (candidate.repeatType == RepeatType.NONE) startDay else horizon
+        val through = minOf(configuredEnd, horizon)
+        val skipped = mutableListOf<SkippedTaskOccurrence>()
+        var day = startDay
+        while (!day.isAfter(through)) {
+            if (occurs(candidate, day)) {
+                val conflicts = collectTimelineConflicts(
+                    candidate.scheduleId,
+                    timedWindow(day.toString(), candidate.startTime, candidate.endTime),
+                    excludeTaskId = candidate.id,
+                    activeTasks = activeTasks
+                )
+                val names = buildList {
+                    conflicts.tasks.forEach { add("任務：${it.effective.name}") }
+                    conflicts.protectedTasks.forEach { add("已結算任務：${it.effective.name}") }
+                    conflicts.rewards.forEach { add("獎勵：${it.item.name}") }
+                }.distinct()
+                if (names.isNotEmpty()) skipped += SkippedTaskOccurrence(day.toString(), names)
+            }
+            day = day.plusDays(1)
+        }
+        return TaskLibrarySchedulePreview(
+            skippedOccurrences = skipped,
+            examinedThrough = through.toString(),
+            limitedToPreviewWindow = candidate.repeatType != RepeatType.NONE && (candidate.repeatEndDate.isBlank() || configuredEnd.isAfter(horizon))
         )
     }
 
@@ -656,10 +776,42 @@ class MissionRepository(private val db: AppDatabase) {
         }
     }
 
-    private suspend fun ensure(day: LocalDate, scheduleId: String): List<TaskEntity> {
-        val due = taskDao.activeTasks(scheduleId).filter { occurs(it, day) }
-        due.forEach { taskDao.insertInstance(TaskInstanceEntity(taskId = it.id, scheduledDate = day.toString())) }
+    private suspend fun ensure(day: LocalDate, scheduleId: String, activeTasks: List<TaskEntity>? = null): List<TaskEntity> {
+        val due = (activeTasks ?: taskDao.activeTasks(scheduleId)).filter { occurs(it, day) }
+        due.forEach { task ->
+            if (taskDao.instance(task.id, day.toString()) != null) return@forEach
+            if (!task.timelineOnly && generatedTaskOverlapsExistingTimeline(task, day)) return@forEach
+            taskDao.insertInstance(TaskInstanceEntity(taskId = task.id, scheduledDate = day.toString()))
+        }
         return due
+    }
+
+    /**
+     * Task-library definitions never overwrite concrete day entries.  When an
+     * occurrence collides, it is simply omitted for that day; the definition
+     * remains available for every later non-conflicting occurrence.
+     */
+    private suspend fun generatedTaskOverlapsExistingTimeline(task: TaskEntity, day: LocalDate): Boolean {
+        if (task.allDay || task.startTime.isBlank() || task.endTime.isBlank()) return false
+        val window = runCatching { timedWindow(day.toString(), task.startTime, task.endTime) }.getOrNull() ?: return false
+        val taskOverlap = taskDao.instancesForDate(day.toString()).any { instance ->
+            if (instance.deleted || instance.taskId == task.id) return@any false
+            val template = taskDao.task(instance.taskId) ?: return@any false
+            if (template.scheduleId != task.scheduleId) return@any false
+            val effective = effectiveTask(template, instance)
+            if (effective.allDay || effective.startTime.isBlank() || effective.endTime.isBlank()) return@any false
+            val existingStart = runCatching { day.atTime(LocalTime.parse(effective.startTime)) }.getOrNull() ?: return@any false
+            val existingEnd = runCatching {
+                if (effective.endTime == "24:00") day.plusDays(1).atStartOfDay() else day.atTime(LocalTime.parse(effective.endTime))
+            }.getOrNull() ?: return@any false
+            window.start.isBefore(existingEnd) && existingStart.isBefore(window.end)
+        }
+        if (taskOverlap) return true
+        val startAt = window.start.atZone(ZoneId.systemDefault()).toInstant().toEpochMilli()
+        val endAt = window.end.atZone(ZoneId.systemDefault()).toInstant().toEpochMilli()
+        return shopDao.overlappingSchedules(startAt, endAt).any { exchange ->
+            shopDao.item(exchange.shopItemId)?.scheduleId == task.scheduleId
+        }
     }
 
     suspend fun dashboard(day: LocalDate, scheduleId: String): DashboardData {
@@ -829,7 +981,7 @@ class MissionRepository(private val db: AppDatabase) {
     suspend fun updateRewardInstance(exchangeId: String, scheduledAt: Long?, scheduledEndAt: Long?, note: String) = db.withTransaction { val exchange = shopDao.exchange(exchangeId) ?: error("找不到獎勵實例"); if (scheduledAt != null && scheduledEndAt != null) require(scheduledEndAt > scheduledAt) { "結束時間必須晚於開始時間" }; shopDao.updateExchange(exchange.copy(scheduledAt = scheduledAt, scheduledEndAt = scheduledEndAt, note = note)) }
     suspend fun deleteRewardInstance(exchangeId: String) = db.withTransaction { val exchange = shopDao.exchange(exchangeId) ?: error("找不到獎勵實例"); val item = shopDao.item(exchange.shopItemId); val old = walletDao.wallet() ?: WalletEntity(); val updated = old.copy(coins = old.coins + exchange.coinCost, diamonds = old.diamonds + exchange.diamondCost, updatedAt = System.currentTimeMillis()); shopDao.deleteExchange(exchange); walletDao.save(updated); walletDao.transaction(TransactionEntity(type = TransactionType.MANUAL_ADJUSTMENT, coinChange = exchange.coinCost, diamondChange = exchange.diamondCost, coinsBefore = old.coins, coinsAfter = updated.coins, diamondsBefore = old.diamonds, diamondsAfter = updated.diamonds, relatedShopItemId = exchange.shopItemId, scheduleId = item?.scheduleId ?: DEFAULT_SCHEDULE_ID, note = "取消獎勵實例，退回貨幣")) }
 
-    /** Library tasks have no overwrite action, so any timed collision remains an error. */
+    /** Strict creation path used when the caller has not confirmed an overwrite strategy. */
     private suspend fun checkTaskConflict(candidate: TaskEntity) {
         candidate.timedWindowOrNull()?.let { window -> checkNoTimelineConflict(candidate.scheduleId, window, candidate.id) }
     }
@@ -857,9 +1009,10 @@ class MissionRepository(private val db: AppDatabase) {
         scheduleId: String,
         window: TimelineWindow,
         excludeTaskId: String? = null,
-        excludeInstanceId: String? = null
+        excludeInstanceId: String? = null,
+        activeTasks: List<TaskEntity>? = null
     ): TimelineConflicts {
-        ensure(window.day, scheduleId)
+        ensure(window.day, scheduleId, activeTasks)
         val tasks = mutableListOf<TaskTimelineConflict>()
         val protected = mutableListOf<TaskTimelineConflict>()
         taskDao.instancesForDate(window.day.toString()).forEach { instance ->
@@ -904,8 +1057,13 @@ class MissionRepository(private val db: AppDatabase) {
     }
 
     /** Applies the already-previewed overwrite again inside the write transaction to avoid stale conflicts. */
-    private suspend fun applyTimelineOverwrite(scheduleId: String, window: TimelineWindow, strategy: TimelineOverwriteStrategy) {
-        val conflicts = collectTimelineConflicts(scheduleId, window)
+    private suspend fun applyTimelineOverwrite(
+        scheduleId: String,
+        window: TimelineWindow,
+        strategy: TimelineOverwriteStrategy,
+        excludeTaskId: String? = null
+    ) {
+        val conflicts = collectTimelineConflicts(scheduleId, window, excludeTaskId = excludeTaskId)
         check(conflicts.protectedTasks.isEmpty()) { "已結算的任務會保留紀錄，無法被覆寫" }
         conflicts.tasks.forEach { conflict ->
             if (conflict.fullyCovered || strategy == TimelineOverwriteStrategy.REMOVE_PARTIAL_TASKS) {

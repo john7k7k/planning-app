@@ -50,6 +50,7 @@ class MissionViewModel(
     private var dateQueryJob: Job? = null
     private var prefetchJob: Job? = null
     private var overwritePreviewJob: Job? = null
+    private var librarySchedulePreviewJob: Job? = null
 
     init {
         viewModelScope.launch { repo.initialize() }
@@ -207,6 +208,24 @@ class MissionViewModel(
         runCatching { repo.createTimelineTaskWithOverwrite(task.copy(scheduleId = activeScheduleId.value), strategy) }
             .onSuccess { say("單次任務已加入時間軸並套用覆寫"); refresh(); loadMonth(_state.value.selectedMonth) }
             .onFailure(::fail)
+    }
+    fun saveTaskWithOverwrite(task: TaskEntity, strategy: TimelineOverwriteStrategy) = viewModelScope.launch {
+        runCatching { repo.saveTaskWithOverwrite(task.copy(scheduleId = activeScheduleId.value), strategy) }
+            .onSuccess { say("任務已儲存並套用覆寫"); refresh(); loadMonth(_state.value.selectedMonth) }
+            .onFailure(::fail)
+    }
+    fun previewTaskLibrarySchedule(task: TaskEntity, previewDays: Int, onReady: (TaskLibrarySchedulePreview) -> Unit, onFailure: (String) -> Unit) {
+        librarySchedulePreviewJob?.cancel()
+        val scheduleId = activeScheduleId.value
+        librarySchedulePreviewJob = viewModelScope.launch {
+            try {
+                onReady(repo.taskLibrarySchedulePreview(task.copy(scheduleId = scheduleId), previewDays))
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
+                onFailure(error.message ?: "無法預覽任務實例")
+            }
+        }
     }
     fun deleteTask(task: TaskEntity) = viewModelScope.launch { runCatching { repo.deleteTask(task) }.onSuccess { say("任務已刪除"); refresh(); loadMonth(_state.value.selectedMonth) }.onFailure(::fail) }
     fun saveCategory(name: String, icon: String) = viewModelScope.launch { runCatching { repo.saveCategory(activeScheduleId.value, name, icon) }.onSuccess { say("分類已新增") }.onFailure(::fail) }
