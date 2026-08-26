@@ -1171,13 +1171,13 @@ private fun TaskFormDialog(
                 Field("任務名稱", name) { name = it }
                 Field("描述", description) { description = it }
                 Field("日期 YYYY-MM-DD", date) { date = it }
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Checkbox(allDay, { allDay = it })
-                    Text("全天任務")
-                }
                 if (!allDay) Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Field("開始 HH:mm", start, Modifier.weight(1f)) { start = it }
                     Field("結束 HH:mm", end, Modifier.weight(1f)) { end = it }
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(allDay, { allDay = it })
+                    Text("全天任務")
                 }
                 if (previewTimelineOverwrite != null && needsOverwritePreview) {
                     TimelineOverwritePreviewHint(activeOverwritePreview, overwritePreviewError, allowOverwrite = overwrite != null)
@@ -1275,7 +1275,7 @@ private fun TimelineOverwritePreviewHint(preview: TimelineOverwritePreview?, err
                 Text("部分重疊任務：${it.joinToString("、") { target -> target.overwriteLabel() }}", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall)
             }
             (preview.fullyCoveredRewards + preview.partiallyOverlappedRewards).takeIf { it.isNotEmpty() }?.let {
-                Text("衝突獎勵會取消並退款：${it.joinToString("、") { target -> target.overwriteLabel() }}", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall)
+                Text("衝突獎勵：${it.joinToString("、") { target -> target.overwriteLabel() }}", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall)
             }
         }
     }
@@ -1298,11 +1298,15 @@ private fun TimelineOverwriteConfirmationDialog(
                 Text("新日程會加入時間軸，以下項目將依你的選擇處理。", color = Color.Gray, style = MaterialTheme.typography.bodySmall)
                 preview.fullyCoveredTasks.takeIf { it.isNotEmpty() }?.let { targets ->
                     Text("完整覆寫的任務", fontWeight = FontWeight.Bold)
-                    targets.forEach { Text("• ${it.overwriteLabel()}", style = MaterialTheme.typography.bodySmall) }
+                    targets.forEach {
+                        Text("• ${if (it.isImportant) "【重要任務】" else ""}${it.overwriteLabel()}", style = MaterialTheme.typography.bodySmall, color = if (it.isImportant) MaterialTheme.colorScheme.error else Color.Unspecified)
+                    }
                 }
                 preview.partiallyOverlappedTasks.takeIf { it.isNotEmpty() }?.let { targets ->
                     Text("部分重疊的任務", fontWeight = FontWeight.Bold)
-                    targets.forEach { Text("• ${it.overwriteLabel()}", style = MaterialTheme.typography.bodySmall) }
+                    targets.forEach {
+                        Text("• ${if (it.isImportant) "【重要任務】" else ""}${it.overwriteLabel()}", style = MaterialTheme.typography.bodySmall, color = if (it.isImportant) MaterialTheme.colorScheme.error else Color.Unspecified)
+                    }
                     Row(Modifier.fillMaxWidth().clickable { strategy = TimelineOverwriteStrategy.TRIM_PARTIAL_TASKS }, verticalAlignment = Alignment.CenterVertically) {
                         RadioButton(strategy == TimelineOverwriteStrategy.TRIM_PARTIAL_TASKS, { strategy = TimelineOverwriteStrategy.TRIM_PARTIAL_TASKS })
                         Column(Modifier.padding(start = 4.dp)) {
@@ -1316,7 +1320,7 @@ private fun TimelineOverwriteConfirmationDialog(
                     }
                 }
                 rewards.takeIf { it.isNotEmpty() }?.let { targets ->
-                    Text("衝突的獎勵（將取消並退款）", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.error)
+                    Text("衝突的獎勵（將取消並退款）", fontWeight = FontWeight.Bold)
                     targets.forEach { Text("• ${it.overwriteLabel()}", style = MaterialTheme.typography.bodySmall) }
                 }
             }
@@ -1459,7 +1463,6 @@ private fun InstanceEditDialog(
                 Field("描述", description) { description = it }
                 Field("地點", location) { location = it }
                 Field("地址", address) { address = it }
-                Row(verticalAlignment = Alignment.CenterVertically) { Checkbox(allDay, { allDay = it }); Text("全天任務") }
                 if (!allDay) {
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Field("開始 HH:mm", start, Modifier.weight(1f)) { start = it }
@@ -1467,6 +1470,7 @@ private fun InstanceEditDialog(
                     }
                     conflicts.forEach { Text("⚠ $it", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall) }
                 }
+                Row(verticalAlignment = Alignment.CenterVertically) { Checkbox(allDay, { allDay = it }); Text("全天任務") }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Field("金幣獎勵", coins, Modifier.weight(1f)) { coins = it }
                     Field("鑽石獎勵", diamonds, Modifier.weight(1f)) { diamonds = it }

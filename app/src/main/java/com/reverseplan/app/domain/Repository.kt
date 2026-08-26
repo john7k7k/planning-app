@@ -62,7 +62,8 @@ data class TimelineConflictTarget(
     val name: String,
     val startTime: String,
     val endTime: String,
-    val fullyCovered: Boolean
+    val fullyCovered: Boolean,
+    val isImportant: Boolean = false
 )
 
 /** How partially-overlapped unfinished tasks are handled on confirmation. */
@@ -597,7 +598,8 @@ class MissionRepository(private val db: AppDatabase) {
             name = effective.name,
             startTime = effective.startTime,
             endTime = effective.endTime,
-            fullyCovered = fullyCovered
+            fullyCovered = fullyCovered,
+            isImportant = effective.priority == TaskPriority.RED
         )
         fun RewardTimelineConflict.target() = TimelineConflictTarget(
             id = exchange.id,

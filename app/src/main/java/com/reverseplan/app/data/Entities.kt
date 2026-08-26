@@ -67,7 +67,7 @@ data class TaskEntity(
     val startDate: String,
     val startTime: String = "",
     val endTime: String = "",
-    val allDay: Boolean = true,
+    val allDay: Boolean = false,
     val repeatType: RepeatType = RepeatType.NONE,
     /** CSV format such as days=1,3,5;interval=2;monthDay=1 */
     val repeatConfig: String = "",
