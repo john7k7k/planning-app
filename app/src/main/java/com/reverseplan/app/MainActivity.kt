@@ -48,6 +48,7 @@ import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -213,7 +214,16 @@ private fun HomeDatePicker(
         if (priorityMonth != visibleMonth) emptyMap() else priorityTasks
             .groupBy { it.date }
             .mapValues { (_, tasks) ->
-                tasks.sortedWith(compareBy<CalendarPriorityTask> { if (it.priority == TaskPriority.RED) 0 else 1 }.thenBy { it.startTime.ifBlank { "99:99" } })
+                tasks.sortedWith(
+                    compareBy<CalendarPriorityTask> {
+                        when {
+                            !it.settled && it.priority == TaskPriority.RED -> 0
+                            !it.settled && it.priority == TaskPriority.ORANGE -> 1
+                            it.settled && it.priority == TaskPriority.RED -> 2
+                            else -> 3
+                        }
+                    }.thenBy { it.startTime.ifBlank { "99:99" } }
+                )
             }
     }
     fun goToInputDate() {
@@ -302,7 +312,7 @@ private fun CalendarPriorityDayCell(
     LaunchedEffect(selectionPending) {
         if (selectionPending) {
             // Keep the standard press ripple visible before the dialog closes.
-            delay(150)
+            delay(10)
             select()
         }
     }
@@ -321,20 +331,22 @@ private fun CalendarPriorityDayCell(
             modifier = if (isToday) Modifier.background(Violet, RoundedCornerShape(50)).padding(horizontal = 5.dp, vertical = 1.dp) else Modifier.padding(vertical = 1.dp)
         ) else Spacer(Modifier.height(20.dp))
         tasks.take(5).forEach { task ->
-            val color = if (task.priority == TaskPriority.RED) Color(0xFFD92D20) else Color(0xFFE67E22)
+            val color = (if (task.priority == TaskPriority.RED) Color(0xFFD92D20) else Color(0xFFE67E22))
+                .copy(alpha = if (task.settled) .52f else 1f)
             BoxWithConstraints(
                 Modifier.fillMaxWidth().padding(top = 1.dp).background(color, RoundedCornerShape(2.dp)).padding(horizontal = 1.dp, vertical = 1.dp)
             ) {
                 // The sixth CJK glyph is intentionally clipped halfway, signaling more text without an ellipsis.
                 val previewFontSize = (maxWidth.value / 5.5f).sp
                 Text(
-                    task.name,
+                    if (task.settled) "${task.name}          " else task.name,
                     color = Color.White,
                     maxLines = 1,
                     softWrap = false,
                     overflow = TextOverflow.Clip,
                     fontSize = previewFontSize,
-                    lineHeight = (previewFontSize.value * 1.18f).sp
+                    lineHeight = (previewFontSize.value * 1.18f).sp,
+                    textDecoration = if (task.settled) TextDecoration.LineThrough else null
                 )
             }
         }
@@ -384,6 +396,7 @@ private fun Dashboard(state: MissionUiState, vm: MissionViewModel, chooseDate: (
     var quickAddInitial by remember { mutableStateOf<TaskEntity?>(null) }
     var viewingCompleted by remember { mutableStateOf(false) }
     var scrollToEntryKey by remember { mutableStateOf<String?>(null) }
+    var returningToToday by remember { mutableStateOf(false) }
     var currentTime by remember { mutableStateOf(LocalTime.now()) }
     val timelineListState = rememberLazyListState()
     val density = LocalDensity.current
@@ -395,6 +408,14 @@ private fun Dashboard(state: MissionUiState, vm: MissionViewModel, chooseDate: (
     }
     val data = if (state.isDateLoading) null else state.dashboard
     val isToday = state.selectedDate == LocalDate.now()
+    LaunchedEffect(returningToToday) {
+        if (returningToToday) {
+            // Keep the press ripple visible before the date changes.
+            delay(150)
+            vm.loadDate(LocalDate.now())
+            returningToToday = false
+        }
+    }
     val urgentCards = data?.cards.orEmpty().filter { !it.instance.settled && it.task.priority == TaskPriority.RED }
     val attentionCards = data?.cards.orEmpty().filter { !it.instance.settled && it.task.priority == TaskPriority.ORANGE }
     val progressPreviewCards = data?.cards.orEmpty()
@@ -452,7 +473,9 @@ private fun Dashboard(state: MissionUiState, vm: MissionViewModel, chooseDate: (
             item {
                 Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
                     Text("每日行程", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-                    TextButton({ vm.loadDate(LocalDate.now()) }) { Icon(Icons.Default.Today, null); Spacer(Modifier.width(4.dp)); Text("回到今天") }
+                    if (!isToday) {
+                        TextButton(onClick = { returningToToday = true }) { Icon(Icons.Default.Today, null); Spacer(Modifier.width(4.dp)); Text("回到今天") }
+                    }
                     TextButton(chooseDate) { Icon(Icons.Default.CalendarMonth, null); Spacer(Modifier.width(4.dp)); Text("選擇日期") }
                 }
                 Box(Modifier.padding(horizontal = 16.dp)) {
