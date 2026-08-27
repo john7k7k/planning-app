@@ -23,6 +23,7 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -44,11 +45,13 @@ import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.zIndex
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -394,6 +397,7 @@ private fun Dashboard(state: MissionUiState, vm: MissionViewModel, chooseDate: (
     var reviewing by remember { mutableStateOf<TaskCardModel?>(null) }
     var editingReward by remember { mutableStateOf<RewardSchedule?>(null) }
     var quickAddInitial by remember { mutableStateOf<TaskEntity?>(null) }
+    var secretRecordCard by remember { mutableStateOf<TaskCardModel?>(null) }
     var viewingCompleted by remember { mutableStateOf(false) }
     var scrollToEntryKey by remember { mutableStateOf<String?>(null) }
     var returningToToday by remember { mutableStateOf(false) }
@@ -541,7 +545,8 @@ private fun Dashboard(state: MissionUiState, vm: MissionViewModel, chooseDate: (
                             state.categories.firstOrNull { it.id == entry.card.task.categoryId },
                             currentTime = currentTime.takeIf { state.selectedDate == LocalDate.now() },
                             onSettle = { settling = entry.card },
-                            onEdit = { if (entry.card.instance.settled) reviewing = entry.card else editing = entry.card }
+                            onEdit = { if (entry.card.instance.settled) reviewing = entry.card else editing = entry.card },
+                            onOpenSecret = { if (state.hasSecretKey) secretRecordCard = entry.card }
                         )
                         is RewardEntry -> RewardTimelineItem(entry.reward, currentTime.takeIf { state.selectedDate == LocalDate.now() }) { editingReward = entry.reward }
                         is CurrentTimeEntry -> CurrentTimeTimelineMarker(entry.currentTime)
@@ -585,6 +590,16 @@ private fun Dashboard(state: MissionUiState, vm: MissionViewModel, chooseDate: (
             dismiss = { reviewing = null },
             saveResult = { result -> vm.updateSettledResult(card.instance.id, result) },
             undo = { error -> vm.undoSettlement(card.instance.id, onSuccess = { reviewing = null }, onFailure = error) }
+        )
+    }
+    secretRecordCard?.let { card ->
+        SecretRecordDialog(
+            card = card,
+            hasSecretKey = state.hasSecretKey,
+            dismiss = { secretRecordCard = null },
+            unlock = { key, success, failure -> vm.readSecretRecord(card.instance.id, key, success, failure) },
+            save = { content, success, failure -> vm.saveSecretRecord(card.instance.id, content, success, failure) },
+            cancelOperation = vm::cancelSecretOperation
         )
     }
     editing?.let { card ->
@@ -892,7 +907,8 @@ private fun TimelineTask(
     category: TaskCategoryEntity?,
     currentTime: LocalTime?,
     onSettle: () -> Unit,
-    onEdit: () -> Unit
+    onEdit: () -> Unit,
+    onOpenSecret: () -> Unit = {}
 ) {
     val nowProgress = currentTime?.let { timelineProgress(card.task.startTime, card.task.endTime, it) }
     val axisLineColor = Violet.copy(alpha = .38f)
@@ -916,7 +932,7 @@ private fun TimelineTask(
             Box(
                 Modifier.weight(1f).padding(bottom = 12.dp).onSizeChanged { cardHeightPx = it.height }
             ) {
-                TaskCard(card, category, onSettle, onEdit)
+                TaskCard(card, category, onSettle, onEdit, onOpenSecret)
             }
         }
         nowProgress?.let { progress ->
@@ -1041,7 +1057,13 @@ private fun LegacyRewardTimelineItem(reward: RewardSchedule, currentTime: LocalT
 }
 
 @Composable
-private fun TaskCard(card: TaskCardModel, category: TaskCategoryEntity?, onSettle: () -> Unit, onEdit: () -> Unit) {
+private fun TaskCard(
+    card: TaskCardModel,
+    category: TaskCategoryEntity?,
+    onSettle: () -> Unit,
+    onEdit: () -> Unit,
+    onOpenSecret: () -> Unit = {}
+) {
     val task = card.task
     var detail by remember { mutableStateOf(false) }
     Card(
@@ -1093,12 +1115,35 @@ private fun TaskCard(card: TaskCardModel, category: TaskCategoryEntity?, onSettl
             }
         }
     }
-    if (detail) AlertDialog(
-        onDismissRequest = { detail = false },
-        title = { Text(if (card.instance.settled) "完成心得" else task.name) },
-        text = { Text(if (card.instance.settled) card.instance.result else task.description) },
-        confirmButton = { TextButton({ detail = false }) { Text("關閉") } }
-    )
+    if (detail) {
+        var secretTapCount by remember(card.instance.id) { mutableIntStateOf(0) }
+        LaunchedEffect(secretTapCount) {
+            if (secretTapCount > 0) {
+                delay(1_000)
+                secretTapCount = 0
+            }
+        }
+        AlertDialog(
+            onDismissRequest = { detail = false },
+            title = { Text(if (card.instance.settled) "完成心得" else task.name) },
+            text = {
+                Text(
+                    if (card.instance.settled) card.instance.result else task.description,
+                    modifier = Modifier.pointerInput(card.instance.id) {
+                        detectTapGestures(onTap = {
+                            secretTapCount += 1
+                            if (secretTapCount >= 3) {
+                                secretTapCount = 0
+                                detail = false
+                                onOpenSecret()
+                            }
+                        })
+                    }
+                )
+            },
+            confirmButton = { TextButton({ detail = false }) { Text("關閉") } }
+        )
+    }
 }
 
 private fun priorityColor(priority: TaskPriority): Color? = when (priority) {
@@ -1182,6 +1227,99 @@ private fun TaskReviewDialog(card: TaskCardModel, dismiss: () -> Unit, saveResul
             TextButton({ undoError = null; undo { undoError = it } }, colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)) { Text("撤回") }
             TextButton(dismiss) { Text("關閉") }
         } }
+    )
+}
+
+@Composable
+private fun SecretRecordDialog(
+    card: TaskCardModel,
+    hasSecretKey: Boolean,
+    dismiss: () -> Unit,
+    unlock: (String, (String) -> Unit, (String) -> Unit) -> Unit,
+    save: (String, () -> Unit, (String) -> Unit) -> Unit,
+    cancelOperation: () -> Unit
+) {
+    val hasSecretRecord = card.instance.secretRecordEncrypted.isNotBlank()
+    var key by remember(card.instance.id) { mutableStateOf("") }
+    var content by remember(card.instance.id) { mutableStateOf("") }
+    var unlocked by remember(card.instance.id) { mutableStateOf(!hasSecretRecord) }
+    var error by remember(card.instance.id) { mutableStateOf<String?>(null) }
+    var confirmDelete by remember(card.instance.id) { mutableStateOf(false) }
+    var processing by remember(card.instance.id) { mutableStateOf(false) }
+    AlertDialog(
+        onDismissRequest = dismiss,
+        title = { Text("秘密紀錄") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(card.task.name, fontWeight = FontWeight.Bold)
+                if (!hasSecretKey) {
+                    Text("請先前往「交易紀錄」，連續點擊標題三次以設定秘密金鑰。", color = Color.Gray)
+                } else if (unlocked) {
+                    Field("秘密紀錄", content) { content = it }
+                    Text("此內容只與這個任務實例連結，不會因任務完成或撤回而改變。", color = Color.Gray, style = MaterialTheme.typography.labelSmall)
+                } else {
+                    OutlinedTextField(
+                        value = key,
+                        onValueChange = { key = it; error = null },
+                        label = { Text("秘密金鑰") },
+                        visualTransformation = PasswordVisualTransformation(),
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Text("驗證成功後才能查看或編輯秘密紀錄。", color = Color.Gray, style = MaterialTheme.typography.labelSmall)
+                }
+                error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+            }
+        },
+        confirmButton = {
+            if (hasSecretKey) {
+                if (unlocked) Button(onClick = {
+                    if (!processing) {
+                        processing = true
+                        save(content, dismiss) { error = it; processing = false }
+                    }
+                }) {
+                    if (processing) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp, color = LocalContentColor.current)
+                    else Text("儲存")
+                } else Button(onClick = {
+                    if (!processing) {
+                        processing = true
+                        unlock(
+                            key,
+                            { decrypted -> content = decrypted; unlocked = true; error = null; processing = false },
+                            { error = it; processing = false }
+                        )
+                    }
+                }) {
+                    if (processing) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp, color = LocalContentColor.current)
+                    else Text("驗證金鑰")
+                }
+            }
+        },
+        dismissButton = {
+            Row {
+                if (unlocked && hasSecretRecord) TextButton(
+                    onClick = { confirmDelete = true },
+                    colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)
+                ) { Text("刪除") }
+                TextButton({ if (processing) cancelOperation(); dismiss() }) { Text("取消") }
+            }
+        }
+    )
+    if (confirmDelete) AlertDialog(
+        onDismissRequest = { confirmDelete = false },
+        title = { Text("刪除秘密紀錄？") },
+        text = { Text("刪除後無法復原。") },
+        confirmButton = { Button(onClick = {
+            if (!processing) {
+                processing = true
+                save("", dismiss) { error = it; confirmDelete = false; processing = false }
+            }
+        }) {
+            if (processing) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp, color = LocalContentColor.current)
+            else Text("確認刪除")
+        } },
+        dismissButton = { TextButton({ if (processing) { cancelOperation(); processing = false }; confirmDelete = false }) { Text("取消") } }
     )
 }
 
@@ -2268,6 +2406,7 @@ private enum class SettingPage { HOME, WALLET, TRANSACTIONS, SCHEDULES, PUZZLES,
 private fun Settings(state: MissionUiState, vm: MissionViewModel) {
     var page by remember { mutableStateOf(SettingPage.HOME) }
     var editingPuzzle by remember { mutableStateOf<SchedulePuzzleEntity?>(null) }
+    var configuringSecretKey by remember { mutableStateOf(false) }
     val context = LocalContext.current
     var exportText by remember { mutableStateOf<String?>(null) }
     val exportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri ->
@@ -2286,7 +2425,7 @@ private fun Settings(state: MissionUiState, vm: MissionViewModel) {
     when (page) {
         SettingPage.HOME -> SettingsHome(state) { page = it }
         SettingPage.WALLET -> WalletSettings({ page = SettingPage.HOME }, vm)
-        SettingPage.TRANSACTIONS -> TransactionHistory({ page = SettingPage.HOME }, state.transactions)
+        SettingPage.TRANSACTIONS -> TransactionHistory({ page = SettingPage.HOME }, state.transactions) { configuringSecretKey = true }
         SettingPage.SCHEDULES -> MySchedules(
             state = state,
             back = { page = SettingPage.HOME },
@@ -2327,6 +2466,15 @@ private fun Settings(state: MissionUiState, vm: MissionViewModel) {
             }
         )
     }
+    if (configuringSecretKey) {
+        SecretKeySettingsDialog(
+            hasSecretKey = state.hasSecretKey,
+            encryptedRecordCount = state.secretRecordCount,
+            dismiss = { configuringSecretKey = false },
+            save = { currentKey, newKey, success, failure -> vm.updateSecretKey(currentKey, newKey, success, failure) },
+            clear = { success, failure -> vm.clearSecretRecords(success, failure) }
+        )
+    }
 }
 
 @Composable
@@ -2354,10 +2502,15 @@ private fun SettingRow(title: String, detail: String, icon: androidx.compose.ui.
 }
 
 @Composable
-private fun SettingsHeader(title: String, back: () -> Unit, actions: @Composable RowScope.() -> Unit = {}) {
+private fun SettingsHeader(
+    title: String,
+    back: () -> Unit,
+    titleModifier: Modifier = Modifier,
+    actions: @Composable RowScope.() -> Unit = {}
+) {
     Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
         IconButton(back) { Icon(Icons.Default.ArrowBack, "返回") }
-        Text(title, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+        Text(title, modifier = titleModifier, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
         Spacer(Modifier.weight(1f))
         actions()
     }
@@ -2381,9 +2534,28 @@ private fun WalletSettings(back: () -> Unit, vm: MissionViewModel) {
 }
 
 @Composable
-private fun TransactionHistory(back: () -> Unit, transactions: List<TransactionEntity>) {
+private fun TransactionHistory(back: () -> Unit, transactions: List<TransactionEntity>, openSecretKeySettings: () -> Unit) {
+    var titleTapCount by remember { mutableIntStateOf(0) }
+    LaunchedEffect(titleTapCount) {
+        if (titleTapCount > 0) {
+            delay(1_000)
+            titleTapCount = 0
+        }
+    }
     Column(Modifier.fillMaxSize()) {
-        SettingsHeader("交易紀錄", back)
+        SettingsHeader(
+            title = "交易紀錄",
+            back = back,
+            titleModifier = Modifier.pointerInput(Unit) {
+                detectTapGestures(onTap = {
+                    titleTapCount += 1
+                    if (titleTapCount >= 3) {
+                        titleTapCount = 0
+                        openSecretKeySettings()
+                    }
+                })
+            }
+        )
         LazyColumn(Modifier.fillMaxSize().padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             if (transactions.isEmpty()) item { EmptyHint("這個行程還沒有錢包交易紀錄。") }
             items(transactions, key = { it.id }) { tx ->
@@ -2396,6 +2568,78 @@ private fun TransactionHistory(back: () -> Unit, transactions: List<TransactionE
             item { Spacer(Modifier.height(72.dp)) }
         }
     }
+}
+
+@Composable
+private fun SecretKeySettingsDialog(
+    hasSecretKey: Boolean,
+    encryptedRecordCount: Int,
+    dismiss: () -> Unit,
+    save: (String, String, () -> Unit, (String) -> Unit) -> Unit,
+    clear: (() -> Unit, (String) -> Unit) -> Unit
+) {
+    var currentKey by remember { mutableStateOf("") }
+    var newKey by remember { mutableStateOf("") }
+    var confirmation by remember { mutableStateOf("") }
+    var error by remember { mutableStateOf<String?>(null) }
+    var confirmClear by remember { mutableStateOf(false) }
+    var processing by remember { mutableStateOf(false) }
+    AlertDialog(
+        onDismissRequest = { if (!processing || !hasSecretKey) dismiss() },
+        title = { Text(if (hasSecretKey) "修改秘密金鑰" else "設定秘密金鑰") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (hasSecretKey) SecretKeyField("目前金鑰", currentKey) { currentKey = it; error = null }
+                SecretKeyField(if (hasSecretKey) "新金鑰" else "秘密金鑰", newKey) { newKey = it; error = null }
+                SecretKeyField("再次輸入金鑰", confirmation) { confirmation = it; error = null }
+                if (hasSecretKey) {
+                    Text("目前有 $encryptedRecordCount 則加密訊息。", color = Color.Gray, style = MaterialTheme.typography.labelSmall)
+                    Text("更換金鑰會重新加密所有訊息。處理期間請勿關閉 App 或中斷操作，否則可能造成訊息毀損。", style = MaterialTheme.typography.labelSmall)
+                }
+                error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+            }
+        },
+        confirmButton = {
+            Button(onClick = {
+                if (!processing) when {
+                    newKey.isBlank() -> error = "金鑰不可空白"
+                    newKey != confirmation -> error = "兩次輸入的金鑰不一致"
+                    else -> {
+                        processing = true
+                        save(currentKey, newKey, { processing = false; dismiss() }) { error = it; processing = false }
+                    }
+                }
+            }) { if (processing) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp, color = LocalContentColor.current) else Text("儲存") }
+        },
+        dismissButton = {
+            Row {
+                if (hasSecretKey) TextButton(
+                    onClick = { confirmClear = true },
+                    colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)
+                ) { Text("清除秘密紀錄") }
+                if (!processing) TextButton(dismiss) { Text("取消") }
+            }
+        }
+    )
+    if (confirmClear) AlertDialog(
+        onDismissRequest = { confirmClear = false },
+        title = { Text("清除所有秘密紀錄？") },
+        text = { Text("此行程的所有秘密紀錄與金鑰設定都會永久刪除，且無法復原。") },
+        confirmButton = { Button(onClick = { clear(dismiss) { error = it; confirmClear = false } }) { Text("確認清除") } },
+        dismissButton = { TextButton({ confirmClear = false }) { Text("取消") } }
+    )
+}
+
+@Composable
+private fun SecretKeyField(label: String, value: String, change: (String) -> Unit) {
+    OutlinedTextField(
+        value = value,
+        onValueChange = change,
+        label = { Text(label) },
+        visualTransformation = PasswordVisualTransformation(),
+        singleLine = true,
+        modifier = Modifier.fillMaxWidth()
+    )
 }
 
 @Composable

@@ -226,6 +226,12 @@ class MissionRepository(private val db: AppDatabase) {
             put("name", schedule.name)
             put("exportedAt", System.currentTimeMillis())
             put("includesCompletionData", includeCompletionData)
+            put("secretRecordConfig", JSONObject().apply {
+                put("enabled", schedule.secretRecordsEnabled)
+                // Salt and verifier are not the key; they let an imported encrypted record be opened with the same key.
+                put("salt", schedule.secretKeySalt)
+                put("verifier", schedule.secretKeyVerifier)
+            })
             put("categories", JSONArray(categoryDao.categories(scheduleId).map { category -> JSONObject().apply { put("id", category.id); put("name", category.name); put("icon", category.icon) } }))
             put("tasks", JSONArray(exportedTasks.map { task -> JSONObject().apply {
                 put("id", task.id)
@@ -253,6 +259,13 @@ class MissionRepository(private val db: AppDatabase) {
                 put("categoryIdOverride", instance.categoryIdOverride ?: JSONObject.NULL); put("priorityOverride", instance.priorityOverride?.name ?: JSONObject.NULL)
                 put("checklistOverride", instance.checklistOverride ?: JSONObject.NULL)
             } }))
+            val secretRecords = exportedTasks.flatMap { taskDao.instancesForTask(it.id) }
+                .filter { it.secretRecordEncrypted.isNotBlank() }
+            put("secretRecords", JSONArray(secretRecords.map { instance -> JSONObject().apply {
+                put("taskId", instance.taskId); put("scheduledDate", instance.scheduledDate)
+                // This value is AES-GCM encrypted. The secret key is never exported.
+                put("encrypted", instance.secretRecordEncrypted)
+            } }))
             if (includeCompletionData) {
                 val completedInstances = exportedTasks.flatMap { taskDao.instancesForTask(it.id) }
                     .filter { it.settled || it.result.isNotBlank() }
@@ -274,7 +287,17 @@ class MissionRepository(private val db: AppDatabase) {
     suspend fun importSchedule(jsonText: String): ScheduleEntity = db.withTransaction {
         val source = JSONObject(jsonText)
         require(source.optString("format") == "mission-market-schedule-v1") { "不是支援的行程匯出檔" }
-        val schedule = ScheduleEntity(name = "匯入：" + source.optString("name", "未命名行程"))
+        val importedSecretConfig = source.optJSONObject("secretRecordConfig")
+        val importedSecretSalt = importedSecretConfig?.optString("salt").orEmpty()
+        val importedSecretVerifier = importedSecretConfig?.optString("verifier").orEmpty()
+        val importedSecretEnabled = importedSecretConfig?.optBoolean("enabled", false) == true &&
+            importedSecretSalt.isNotBlank() && importedSecretVerifier.isNotBlank()
+        val schedule = ScheduleEntity(
+            name = "匯入：" + source.optString("name", "未命名行程"),
+            secretRecordsEnabled = importedSecretEnabled,
+            secretKeySalt = importedSecretSalt,
+            secretKeyVerifier = importedSecretVerifier
+        )
         scheduleDao.upsert(schedule)
         seedCategories(schedule.id)
         val categoryMap = mutableMapOf<String, String>()
@@ -329,6 +352,18 @@ class MissionRepository(private val db: AppDatabase) {
                 priorityOverride = sourceInstance.optionalString("priorityOverride")?.let { value -> runCatching { TaskPriority.valueOf(value) }.getOrNull() },
                 checklistOverride = sourceInstance.optionalString("checklistOverride")
             ))
+        }
+        val secretRecords = source.optJSONArray("secretRecords") ?: JSONArray()
+        for (i in 0 until secretRecords.length()) {
+            val secret = secretRecords.getJSONObject(i)
+            val taskId = taskIdMap[secret.optString("taskId")] ?: continue
+            val scheduledDate = secret.optString("scheduledDate", LocalDate.now().toString())
+            val encrypted = secret.optString("encrypted")
+            if (encrypted.isBlank()) continue
+            val existing = taskDao.instance(taskId, scheduledDate)
+            val imported = (existing ?: TaskInstanceEntity(taskId = taskId, scheduledDate = scheduledDate))
+                .copy(secretRecordEncrypted = encrypted)
+            if (existing == null) taskDao.insertInstance(imported) else taskDao.updateInstance(imported)
         }
         val items = source.optJSONArray("shopItems") ?: JSONArray()
         for (i in 0 until items.length()) {
@@ -847,6 +882,64 @@ class MissionRepository(private val db: AppDatabase) {
         priority = instance.priorityOverride ?: task.priority, checklist = instance.checklistOverride ?: task.checklist
     )
 
+    suspend fun hasSecretKey(scheduleId: String): Boolean = scheduleDao.schedule(scheduleId)?.let {
+        it.secretRecordsEnabled && it.secretKeySalt.isNotBlank() && it.secretKeyVerifier.isNotBlank()
+    } == true
+
+    suspend fun secretRecordCount(scheduleId: String): Int = taskDao.tasksForSchedule(scheduleId)
+        .flatMap { taskDao.instancesForTask(it.id) }
+        .count { it.secretRecordEncrypted.isNotBlank() }
+
+    /** Creates a key or rotates it after validating the existing key and re-encrypting every private record. */
+    suspend fun updateSecretKey(scheduleId: String, currentKey: String, newKey: String) = db.withTransaction {
+        require(newKey.isNotBlank()) { "金鑰不可空白" }
+        val schedule = scheduleDao.schedule(scheduleId) ?: error("找不到行程")
+        val oldConfigured = schedule.secretRecordsEnabled && schedule.secretKeySalt.isNotBlank() && schedule.secretKeyVerifier.isNotBlank()
+        val encryptedRecords = taskDao.tasksForSchedule(scheduleId)
+            .flatMap { taskDao.instancesForTask(it.id) }
+            .filter { it.secretRecordEncrypted.isNotBlank() }
+        val plainRecords = if (oldConfigured) {
+            require(SecretRecordCipher.verifies(currentKey, schedule.secretKeySalt, schedule.secretKeyVerifier)) { "目前金鑰不正確" }
+            encryptedRecords.associateWith { SecretRecordCipher.decrypt(it.secretRecordEncrypted, currentKey, schedule.secretKeySalt) }
+        } else {
+            require(encryptedRecords.isEmpty()) { "找不到既有金鑰，無法安全變更秘密紀錄" }
+            emptyMap()
+        }
+        val newSalt = SecretRecordCipher.newSalt()
+        plainRecords.forEach { (instance, plainText) ->
+            taskDao.updateInstance(instance.copy(secretRecordEncrypted = SecretRecordCipher.encrypt(plainText, newKey, newSalt)))
+        }
+        scheduleDao.upsert(schedule.copy(
+            secretRecordsEnabled = true,
+            secretKeySalt = newSalt,
+            secretKeyVerifier = SecretRecordCipher.verifier(newKey, newSalt)
+        ))
+    }
+
+    suspend fun readSecretRecord(instanceId: String, key: String): String = db.withTransaction {
+        val instance = taskDao.instanceById(instanceId) ?: error("找不到任務實例")
+        val task = taskDao.task(instance.taskId) ?: error("找不到任務")
+        val schedule = scheduleDao.schedule(task.scheduleId) ?: error("找不到行程")
+        require(schedule.secretRecordsEnabled && SecretRecordCipher.verifies(key, schedule.secretKeySalt, schedule.secretKeyVerifier)) { "金鑰不正確" }
+        SecretRecordCipher.decrypt(instance.secretRecordEncrypted, key, schedule.secretKeySalt)
+    }
+
+    suspend fun saveSecretRecord(instanceId: String, key: String, content: String) = db.withTransaction {
+        val instance = taskDao.instanceById(instanceId) ?: error("找不到任務實例")
+        val task = taskDao.task(instance.taskId) ?: error("找不到任務")
+        val schedule = scheduleDao.schedule(task.scheduleId) ?: error("找不到行程")
+        require(schedule.secretRecordsEnabled && SecretRecordCipher.verifies(key, schedule.secretKeySalt, schedule.secretKeyVerifier)) { "金鑰不正確" }
+        taskDao.updateInstance(instance.copy(secretRecordEncrypted = if (content.isBlank()) "" else SecretRecordCipher.encrypt(content, key, schedule.secretKeySalt)))
+    }
+
+    suspend fun clearSecretRecords(scheduleId: String) = db.withTransaction {
+        val schedule = scheduleDao.schedule(scheduleId) ?: error("找不到行程")
+        taskDao.tasksForSchedule(scheduleId).flatMap { taskDao.instancesForTask(it.id) }
+            .filter { it.secretRecordEncrypted.isNotBlank() }
+            .forEach { taskDao.updateInstance(it.copy(secretRecordEncrypted = "")) }
+        scheduleDao.upsert(schedule.copy(secretRecordsEnabled = false, secretKeySalt = "", secretKeyVerifier = ""))
+    }
+
     suspend fun updateInstanceContent(instanceId: String, name: String, description: String, location: String, address: String, allDay: Boolean, start: String, end: String, coins: BigDecimal, diamonds: BigDecimal, categoryId: String, priority: TaskPriority, checklist: String) = db.withTransaction {
         val instance = taskDao.instanceById(instanceId) ?: error("找不到任務實例")
         check(!instance.settled) { "已完成任務請先撤回，才能修改任務資訊" }
@@ -877,7 +970,13 @@ class MissionRepository(private val db: AppDatabase) {
         val instance = taskDao.instanceById(instanceId) ?: error("找不到任務實例")
         check(!instance.settled) { "已完成任務請先撤回獎勵，再刪除" }
         val task = taskDao.task(instance.taskId) ?: error("找不到任務")
-        if (task.timelineOnly) { taskDao.deleteInstancesForTask(task.id); taskDao.delete(task) } else taskDao.updateInstance(instance.copy(deleted = true))
+        if (task.timelineOnly) {
+            taskDao.deleteInstancesForTask(task.id)
+            taskDao.delete(task)
+        } else {
+            // The occurrence is retained only to prevent regeneration; private data must not be retained with it.
+            taskDao.updateInstance(instance.copy(deleted = true, secretRecordEncrypted = ""))
+        }
     }
 
     suspend fun undoSettlement(instanceId: String): Result<Pair<BigDecimal, BigDecimal>> = runCatching { db.withTransaction {

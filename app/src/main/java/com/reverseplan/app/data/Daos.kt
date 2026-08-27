@@ -24,6 +24,7 @@ interface TaskDao {
     @Query("SELECT * FROM task_instances WHERE taskId = :taskId ORDER BY scheduledDate DESC LIMIT 1") suspend fun lastInstance(taskId: String): TaskInstanceEntity?
     @Query("SELECT * FROM task_instances WHERE taskId = :taskId") suspend fun instancesForTask(taskId: String): List<TaskInstanceEntity>
     @Query("SELECT * FROM task_instances ORDER BY scheduledDate DESC") fun observeInstances(): Flow<List<TaskInstanceEntity>>
+    @Query("SELECT * FROM task_instances") suspend fun allInstances(): List<TaskInstanceEntity>
     @Update suspend fun updateInstance(instance: TaskInstanceEntity)
     @Query("DELETE FROM task_instances WHERE taskId = :taskId") suspend fun deleteInstancesForTask(taskId: String)
     @Query("DELETE FROM tasks WHERE scheduleId = :scheduleId") suspend fun deleteTasksForSchedule(scheduleId: String)

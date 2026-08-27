@@ -19,7 +19,11 @@ data class ScheduleEntity(
     @PrimaryKey val id: String = UUID.randomUUID().toString(),
     val name: String,
     val isSample: Boolean = false,
-    val createdAt: Long = System.currentTimeMillis()
+    val createdAt: Long = System.currentTimeMillis(),
+    /** Private-record protection is configured independently for every schedule. */
+    val secretRecordsEnabled: Boolean = false,
+    val secretKeySalt: String = "",
+    val secretKeyVerifier: String = ""
 )
 
 @Entity(tableName = "schedule_settings")
@@ -27,7 +31,10 @@ data class ScheduleSettingsEntity(
     @PrimaryKey val id: Int = 1,
     val activeScheduleId: String = "default",
     /** Prevents a deleted example itinerary from being recreated on later launches. */
-    val exampleSchedulesInitialized: Boolean = false
+    val exampleSchedulesInitialized: Boolean = false,
+    /** Salt and verifier only; the secret key itself is never stored. */
+    val secretKeySalt: String = "",
+    val secretKeyVerifier: String = ""
 )
 
 @Entity(tableName = "daily_summaries", indices = [Index(value = ["scheduleId", "date"], unique = true)])
@@ -120,7 +127,9 @@ data class TaskInstanceEntity(
     /** CSV of checked checklist indices for this scheduled instance. */
     val checkedChecklistItems: String = "",
     /** A removed occurrence is retained so repeating tasks do not recreate it. */
-    val deleted: Boolean = false
+    val deleted: Boolean = false,
+    /** AES-GCM encrypted private note, associated with this occurrence only. */
+    val secretRecordEncrypted: String = ""
 )
 
 @Entity(tableName = "task_categories")

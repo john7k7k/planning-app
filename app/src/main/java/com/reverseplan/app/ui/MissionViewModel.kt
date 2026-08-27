@@ -34,6 +34,8 @@ data class MissionUiState(
     val dailySummaries: List<DailySummaryEntity> = emptyList(),
     val shop: List<ShopCardModel> = emptyList(),
     val transactions: List<TransactionEntity> = emptyList(),
+    val hasSecretKey: Boolean = false,
+    val secretRecordCount: Int = 0,
     val error: String? = null,
     val message: String? = null,
     val timeConflicts: List<String> = emptyList(),
@@ -54,13 +56,17 @@ class MissionViewModel(
     private var overwritePreviewJob: Job? = null
     private var librarySchedulePreviewJob: Job? = null
     private var calendarPriorityJob: Job? = null
+    private var secretCryptoJob: Job? = null
+    /** Kept only in memory for the current app session; never written to storage. */
+    private val secretKeySessions = mutableMapOf<String, String>()
 
     init {
         viewModelScope.launch { repo.initialize() }
         viewModelScope.launch {
             repo.activeSchedule().filterNotNull().collect { settings ->
                 activeScheduleId.value = settings.activeScheduleId
-                _state.update { it.copy(activeScheduleId = settings.activeScheduleId, currentDashboard = null, calendarPriorityMonth = null, calendarPriorityTasks = emptyList()) }
+                val hasSecretKey = repo.hasSecretKey(settings.activeScheduleId)
+                _state.update { it.copy(activeScheduleId = settings.activeScheduleId, hasSecretKey = hasSecretKey, currentDashboard = null, calendarPriorityMonth = null, calendarPriorityTasks = emptyList()) }
                 refresh()
                 if (_state.value.selectedDate != LocalDate.now()) refreshCurrentSchedule(settings.activeScheduleId)
                 loadMonth(_state.value.selectedMonth)
@@ -71,7 +77,15 @@ class MissionViewModel(
         viewModelScope.launch { repo.puzzles().collect { puzzles -> _state.update { it.copy(puzzles = puzzles) } } }
         viewModelScope.launch { activeScheduleId.flatMapLatest { repo.dailySummaries(it) }.collect { summaries -> _state.update { it.copy(dailySummaries = summaries) } } }
         viewModelScope.launch { activeScheduleId.flatMapLatest { repo.transactions(it) }.collect { transactions -> _state.update { it.copy(transactions = transactions) } } }
-        viewModelScope.launch { repo.schedules().collect { schedules -> _state.update { it.copy(schedules = schedules) } } }
+        viewModelScope.launch { repo.schedules().collect { schedules ->
+            _state.update { current ->
+                val active = schedules.firstOrNull { it.id == current.activeScheduleId }
+                current.copy(
+                    schedules = schedules,
+                    hasSecretKey = active?.let { it.secretRecordsEnabled && it.secretKeySalt.isNotBlank() && it.secretKeyVerifier.isNotBlank() } == true
+                )
+            }
+        } }
         refresh()
         loadMonth(YearMonth.now())
     }
@@ -114,10 +128,10 @@ class MissionViewModel(
         calendarPriorityJob?.cancel()
         _state.update { it.copy(calendarPriorityMonth = null, calendarPriorityTasks = emptyList()) }
         val scheduleId = activeScheduleId.value
-        runCatching { repo.dashboard(date, scheduleId) to repo.shopCards(scheduleId, date) }
-            .onSuccess { (dashboard, shop) -> _state.update { current ->
+        runCatching { Triple(repo.dashboard(date, scheduleId), repo.shopCards(scheduleId, date), repo.secretRecordCount(scheduleId)) }
+            .onSuccess { (dashboard, shop, secretRecordCount) -> _state.update { current ->
                 if (current.selectedDate != date || current.activeScheduleId != scheduleId) current
-                else current.copy(dashboard = dashboard, shop = shop, currentDashboard = if (date == LocalDate.now()) dashboard else current.currentDashboard, error = null, isDateLoading = false)
+                else current.copy(dashboard = dashboard, shop = shop, secretRecordCount = secretRecordCount, currentDashboard = if (date == LocalDate.now()) dashboard else current.currentDashboard, error = null, isDateLoading = false)
                 }
                 rescheduleTaskNotifications(scheduleId)
             }
@@ -260,6 +274,49 @@ class MissionViewModel(
         repo.undoSettlement(instanceId).onSuccess { (coins, diamonds) -> say("已撤回完成，歸還 🪙 $coins　💎 $diamonds"); refresh(); loadMonth(_state.value.selectedMonth); onSuccess() }.onFailure { onFailure(it.message ?: "撤回失敗") }
     }
     fun updateSettledResult(instanceId: String, result: String) = viewModelScope.launch { runCatching { repo.updateSettledResult(instanceId, result) }.onSuccess { say("任務心得已儲存"); refresh() }.onFailure(::fail) }
+    fun updateSecretKey(currentKey: String, newKey: String, onSuccess: () -> Unit, onFailure: (String) -> Unit) = viewModelScope.launch {
+        val scheduleId = activeScheduleId.value
+        runCatching { repo.updateSecretKey(scheduleId, currentKey, newKey) }
+            .onSuccess { secretKeySessions[scheduleId] = newKey; onSuccess() }
+            .onFailure { onFailure(it.message ?: "無法更新秘密金鑰") }
+    }
+    fun readSecretRecord(instanceId: String, key: String, onSuccess: (String) -> Unit, onFailure: (String) -> Unit) = viewModelScope.launch {
+        secretCryptoJob?.cancel()
+        secretCryptoJob = viewModelScope.launch {
+            try {
+                val record = repo.readSecretRecord(instanceId, key)
+                secretKeySessions[activeScheduleId.value] = key
+                onSuccess(record)
+            } catch (_: CancellationException) {
+                // The dialog has already returned to its idle state.
+            } catch (error: Throwable) {
+                onFailure(error.message ?: "無法開啟秘密紀錄")
+            }
+        }
+    }
+    fun saveSecretRecord(instanceId: String, content: String, onSuccess: () -> Unit, onFailure: (String) -> Unit) = viewModelScope.launch {
+        val key = secretKeySessions[activeScheduleId.value]
+            ?: return@launch onFailure("請先驗證秘密金鑰")
+        secretCryptoJob?.cancel()
+        secretCryptoJob = viewModelScope.launch {
+            try {
+                repo.saveSecretRecord(instanceId, key, content)
+                onSuccess()
+                refresh()
+            } catch (_: CancellationException) {
+                // The dialog has already returned to its idle state.
+            } catch (error: Throwable) {
+                onFailure(error.message ?: "無法儲存秘密紀錄")
+            }
+        }
+    }
+    fun cancelSecretOperation() { secretCryptoJob?.cancel(); secretCryptoJob = null }
+    fun clearSecretRecords(onSuccess: () -> Unit, onFailure: (String) -> Unit) = viewModelScope.launch {
+        val scheduleId = activeScheduleId.value
+        runCatching { repo.clearSecretRecords(scheduleId) }
+            .onSuccess { secretKeySessions.remove(scheduleId); onSuccess(); refresh() }
+            .onFailure { onFailure(it.message ?: "無法清除秘密紀錄") }
+    }
     fun saveDailySummary(date: LocalDate, content: String) = viewModelScope.launch { runCatching { repo.saveDailySummary(activeScheduleId.value, date, content) }.onSuccess { say(if (content.isBlank()) "當日總結已清除" else "當日總結已儲存") }.onFailure(::fail) }
     fun validateTime(date: String, start: String, end: String, taskId: String?, instanceId: String?) = viewModelScope.launch { _state.update { it.copy(timeConflicts = repo.timeConflicts(activeScheduleId.value, date, start, end, taskId, instanceId)) } }
     fun settle(instanceId: String, progress: BigDecimal, result: String, checkedItems: Set<Int>) = viewModelScope.launch { repo.settle(instanceId, progress, result, checkedItems).onSuccess { (coins, diamonds) -> say("結算完成：🪙 $coins　💎 $diamonds"); refresh(); loadMonth(_state.value.selectedMonth) }.onFailure(::fail) }
