@@ -167,6 +167,7 @@ class MissionViewModel(
     private fun rescheduleTaskNotifications(scheduleId: String = activeScheduleId.value) = viewModelScope.launch {
         runCatching { taskNotificationScheduler.scheduleUpcoming(scheduleId) }
     }
+    fun rescheduleNotifications() = rescheduleTaskNotifications()
 
     fun selectSchedule(id: String) = viewModelScope.launch { runCatching { repo.selectSchedule(id) }.onSuccess { say("已切換行程") }.onFailure(::fail) }
     fun createSchedule(name: String) = viewModelScope.launch { runCatching { repo.createSchedule(name) }.onSuccess { say("行程已新增") }.onFailure(::fail) }

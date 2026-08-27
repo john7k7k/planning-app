@@ -56,6 +56,7 @@ class TaskNotificationScheduler(
         val intent = Intent(context, TaskStartReceiver::class.java).apply {
             putExtra(EXTRA_INSTANCE_ID, card.instance.id)
             putExtra(EXTRA_TRIGGER_AT, triggerAt)
+            putExtra(EXTRA_SCHEDULE_ID, card.task.scheduleId)
         }
         val pendingIntent = PendingIntent.getBroadcast(
             context,
@@ -75,6 +76,7 @@ class TaskNotificationScheduler(
         const val CHANNEL_ID = "task_start_reminders"
         const val EXTRA_INSTANCE_ID = "task_instance_id"
         const val EXTRA_TRIGGER_AT = "task_trigger_at"
+        const val EXTRA_SCHEDULE_ID = "task_schedule_id"
 
         fun show(context: Context, instanceId: String, taskName: String, description: String) {
             val launchIntent = Intent(context, MainActivity::class.java).addFlags(
@@ -104,19 +106,25 @@ class TaskStartReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         val instanceId = intent.getStringExtra(TaskNotificationScheduler.EXTRA_INSTANCE_ID) ?: return
         val expectedTriggerAt = intent.getLongExtra(TaskNotificationScheduler.EXTRA_TRIGGER_AT, -1L)
+        val expectedScheduleId = intent.getStringExtra(TaskNotificationScheduler.EXTRA_SCHEDULE_ID) ?: return
         val pendingResult = goAsync()
         CoroutineScope(Dispatchers.IO).launch {
             try {
                 val db = AppDatabase.create(context.applicationContext)
                 val instance = db.taskDao().instanceById(instanceId) ?: return@launch
                 val task = db.taskDao().task(instance.taskId) ?: return@launch
+                val activeScheduleId = db.scheduleDao().settings()?.activeScheduleId ?: MissionRepository.DEFAULT_SCHEDULE_ID
                 val allDay = instance.allDayOverride ?: task.allDay
                 val startTime = instance.startTimeOverride ?: task.startTime
                 val actualTriggerAt = runCatching {
                     LocalDate.parse(instance.scheduledDate).atTime(LocalTime.parse(startTime))
                         .atZone(ZoneId.systemDefault()).toInstant().toEpochMilli()
                 }.getOrNull()
-                if (!instance.deleted && !instance.settled && !allDay && actualTriggerAt == expectedTriggerAt) {
+                if (
+                    expectedScheduleId == activeScheduleId &&
+                    task.scheduleId == activeScheduleId &&
+                    !instance.deleted && !instance.settled && !allDay && actualTriggerAt == expectedTriggerAt
+                ) {
                     TaskNotificationScheduler.show(
                         context,
                         instanceId,
@@ -124,8 +132,7 @@ class TaskStartReceiver : BroadcastReceiver() {
                         instance.descriptionOverride ?: task.description
                     )
                 }
-                val scheduleId = db.scheduleDao().settings()?.activeScheduleId ?: MissionRepository.DEFAULT_SCHEDULE_ID
-                TaskNotificationScheduler(context.applicationContext, MissionRepository(db)).scheduleUpcoming(scheduleId)
+                TaskNotificationScheduler(context.applicationContext, MissionRepository(db)).scheduleUpcoming(activeScheduleId)
             } finally {
                 pendingResult.finish()
             }
