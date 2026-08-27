@@ -21,6 +21,7 @@ data class TaskCardModel(val task: TaskEntity, val instance: TaskInstanceEntity,
 data class RewardSchedule(val item: ShopItemEntity, val exchange: ShopExchangeEntity)
 data class DashboardData(val wallet: WalletEntity, val cards: List<TaskCardModel>, val rewards: List<RewardSchedule>, val earnedCoins: BigDecimal, val earnedDiamonds: BigDecimal)
 data class ShopCardModel(val item: ShopItemEntity, val unlocked: Boolean, val reason: String)
+data class CalendarPriorityTask(val date: LocalDate, val name: String, val startTime: String, val priority: TaskPriority)
 data class DailyCompletion(val date: LocalDate, val completion: Float)
 data class CategoryCompletion(val categoryId: String, val name: String, val icon: String, val completion: Float, val count: Int)
 data class MonthlyStats(
@@ -803,6 +804,26 @@ class MissionRepository(private val db: AppDatabase) {
         val rewards = shopDao.schedulesForDay(start, end).mapNotNull { exchange -> shopDao.item(exchange.shopItemId)?.takeIf { it.scheduleId == scheduleId }?.let { RewardSchedule(it, exchange) } }
         val settled = cards.filter { it.instance.settled }
         return DashboardData(walletDao.wallet() ?: WalletEntity(), cards, rewards, settled.fold(BigDecimal.ZERO) { total, card -> total + card.instance.earnedCoins }, settled.fold(BigDecimal.ZERO) { total, card -> total + card.instance.earnedDiamonds })
+    }
+
+    /** Priority markers for the custom month picker. Only unfinished red/orange task instances are returned. */
+    suspend fun calendarPriorityTasks(scheduleId: String, month: YearMonth): List<CalendarPriorityTask> = db.withTransaction {
+        val activeTasks = taskDao.activeTasks(scheduleId)
+        var day = month.atDay(1)
+        val lastDay = month.atEndOfMonth()
+        while (!day.isAfter(lastDay)) {
+            ensure(day, scheduleId, activeTasks)
+            day = day.plusDays(1)
+        }
+        val tasksById = activeTasks.associateBy { it.id }
+        taskDao.instancesBetween(month.atDay(1).toString(), lastDay.toString()).mapNotNull { instance ->
+            val template = tasksById[instance.taskId] ?: return@mapNotNull null
+            if (instance.deleted || instance.settled) return@mapNotNull null
+            val task = effectiveTask(template, instance)
+            task.priority.takeIf { it == TaskPriority.RED || it == TaskPriority.ORANGE }?.let {
+                CalendarPriorityTask(LocalDate.parse(instance.scheduledDate), task.name, task.startTime, it)
+            }
+        }
     }
 
     private fun effectiveTask(task: TaskEntity, instance: TaskInstanceEntity) = task.copy(

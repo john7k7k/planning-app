@@ -24,6 +24,8 @@ data class MissionUiState(
     val dashboard: DashboardData? = null,
     /** Always represents today's current schedule, independent of the date being browsed. */
     val currentDashboard: DashboardData? = null,
+    val calendarPriorityMonth: YearMonth? = null,
+    val calendarPriorityTasks: List<CalendarPriorityTask> = emptyList(),
     val monthlyStats: MonthlyStats? = null,
     val tasks: List<TaskEntity> = emptyList(),
     val categories: List<TaskCategoryEntity> = emptyList(),
@@ -51,13 +53,14 @@ class MissionViewModel(
     private var prefetchJob: Job? = null
     private var overwritePreviewJob: Job? = null
     private var librarySchedulePreviewJob: Job? = null
+    private var calendarPriorityJob: Job? = null
 
     init {
         viewModelScope.launch { repo.initialize() }
         viewModelScope.launch {
             repo.activeSchedule().filterNotNull().collect { settings ->
                 activeScheduleId.value = settings.activeScheduleId
-                _state.update { it.copy(activeScheduleId = settings.activeScheduleId, currentDashboard = null) }
+                _state.update { it.copy(activeScheduleId = settings.activeScheduleId, currentDashboard = null, calendarPriorityMonth = null, calendarPriorityTasks = emptyList()) }
                 refresh()
                 if (_state.value.selectedDate != LocalDate.now()) refreshCurrentSchedule(settings.activeScheduleId)
                 loadMonth(_state.value.selectedMonth)
@@ -90,10 +93,26 @@ class MissionViewModel(
             .onSuccess { stats -> _state.update { it.copy(monthlyStats = stats) } }
             .onFailure(::fail)
     }
+    fun loadCalendarPriorityTasks(month: YearMonth) {
+        if (_state.value.calendarPriorityMonth == month) return
+        calendarPriorityJob?.cancel()
+        val scheduleId = activeScheduleId.value
+        calendarPriorityJob = viewModelScope.launch {
+            runCatching { repo.calendarPriorityTasks(scheduleId, month) }
+                .onSuccess { tasks ->
+                    _state.update { current ->
+                        if (current.activeScheduleId == scheduleId) current.copy(calendarPriorityMonth = month, calendarPriorityTasks = tasks) else current
+                    }
+                }
+                .onFailure(::fail)
+        }
+    }
     fun refresh(date: LocalDate = _state.value.selectedDate) = viewModelScope.launch {
         dailyCache.clear()
         dateQueryJob?.cancel()
         prefetchJob?.cancel()
+        calendarPriorityJob?.cancel()
+        _state.update { it.copy(calendarPriorityMonth = null, calendarPriorityTasks = emptyList()) }
         val scheduleId = activeScheduleId.value
         runCatching { repo.dashboard(date, scheduleId) to repo.shopCards(scheduleId, date) }
             .onSuccess { (dashboard, shop) -> _state.update { current ->

@@ -4,6 +4,11 @@ import android.os.Bundle
 import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Build
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.togetherWith
+import androidx.compose.animation.core.tween
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -12,6 +17,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -29,6 +35,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.zIndex
@@ -36,8 +43,13 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.core.content.ContextCompat
 import com.reverseplan.app.data.*
@@ -138,22 +150,173 @@ private fun MissionAppUi(vm: MissionViewModel) {
                 state.message?.let { Notice(it, error = false, vm::consumeMessage) }
             }
         }
-        if (showDatePicker) HomeDatePicker(state.selectedDate, { showDatePicker = false }) { date ->
+        if (showDatePicker) HomeDatePicker(
+            initialDate = state.selectedDate,
+            priorityMonth = state.calendarPriorityMonth,
+            priorityTasks = state.calendarPriorityTasks,
+            loadPriorityTasks = vm::loadCalendarPriorityTasks,
+            dismiss = { showDatePicker = false }
+        ) { date ->
             vm.loadDate(date)
             showDatePicker = false
         }
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun HomeDatePicker(initialDate: LocalDate, dismiss: () -> Unit, select: (LocalDate) -> Unit) {
-    val pickerState = rememberDatePickerState(initialSelectedDateMillis = initialDate.toEpochDay() * 86_400_000L)
-    DatePickerDialog(
-        onDismissRequest = dismiss,
-        confirmButton = { Button(onClick = { pickerState.selectedDateMillis?.let { select(LocalDate.ofEpochDay(it / 86_400_000L)) } }, enabled = pickerState.selectedDateMillis != null) { Text("選擇日期") } },
-        dismissButton = { TextButton(dismiss) { Text("取消") } }
-    ) { DatePicker(state = pickerState, title = null, headline = null) }
+private fun HomeDatePicker(
+    initialDate: LocalDate,
+    priorityMonth: YearMonth?,
+    priorityTasks: List<CalendarPriorityTask>,
+    loadPriorityTasks: (YearMonth) -> Unit,
+    dismiss: () -> Unit,
+    select: (LocalDate) -> Unit
+) {
+    var visibleMonth by remember { mutableStateOf(YearMonth.from(initialDate)) }
+    var inputMode by remember { mutableStateOf(false) }
+    var inputDate by remember { mutableStateOf(initialDate.toString()) }
+    var inputError by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(visibleMonth) { loadPriorityTasks(visibleMonth) }
+    val days = remember(visibleMonth) {
+        buildList<LocalDate?> {
+            repeat(visibleMonth.atDay(1).dayOfWeek.value % 7) { add(null) }
+            for (day in 1..visibleMonth.lengthOfMonth()) add(visibleMonth.atDay(day))
+            while (size % 7 != 0) add(null)
+        }
+    }
+    val weeks = remember(days) { days.chunked(7) }
+    val dayCellHeight = (468f / weeks.size).dp
+    val calendarGridLine = Color(0xFFE2E0E8).copy(alpha = .48f)
+    val tasksByDate = remember(priorityMonth, priorityTasks, visibleMonth) {
+        if (priorityMonth != visibleMonth) emptyMap() else priorityTasks
+            .groupBy { it.date }
+            .mapValues { (_, tasks) ->
+                tasks.sortedWith(compareBy<CalendarPriorityTask> { if (it.priority == TaskPriority.RED) 0 else 1 }.thenBy { it.startTime.ifBlank { "99:99" } })
+            }
+    }
+    fun goToInputDate() {
+        val date = runCatching { LocalDate.parse(inputDate) }.getOrNull()
+        if (date == null) inputError = "日期格式須為 YYYY-MM-DD" else select(date)
+    }
+    Dialog(onDismissRequest = dismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+        Surface(
+            shape = RoundedCornerShape(28.dp),
+            color = Color(0xFFF9F7FD),
+            modifier = Modifier.fillMaxWidth(.98f).padding(horizontal = 4.dp)
+        ) {
+            Column(Modifier.padding(horizontal = 12.dp, vertical = 14.dp)) {
+                if (inputMode) {
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Text("輸入日期", fontSize = 19.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                        IconButton({ inputMode = false }, Modifier.size(34.dp)) { Icon(Icons.Default.CalendarMonth, "切換到日曆") }
+                    }
+                } else Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    IconButton({ visibleMonth = visibleMonth.minusMonths(1) }, Modifier.size(34.dp)) { Icon(Icons.Default.ChevronLeft, "上個月") }
+                    Text(
+                        visibleMonth.format(DateTimeFormatter.ofPattern("yyyy 年 M 月")),
+                        fontSize = 18.sp,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                        softWrap = false,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f),
+                        textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                    )
+                    IconButton({ visibleMonth = visibleMonth.plusMonths(1) }, Modifier.size(34.dp)) { Icon(Icons.Default.ChevronRight, "下個月") }
+                    IconButton({ inputMode = true }, Modifier.size(34.dp)) { Icon(Icons.Default.Edit, "輸入日期") }
+                }
+                Spacer(Modifier.height(8.dp))
+                if (inputMode) {
+                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Field("日期 YYYY-MM-DD", inputDate, required = true) { inputDate = it; inputError = null }
+                        inputError?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall) }
+                    }
+                } else {
+                    Column(Modifier.heightIn(max = 510.dp).verticalScroll(rememberScrollState())) {
+                        Row(Modifier.fillMaxWidth()) {
+                            listOf("日", "一", "二", "三", "四", "五", "六").forEach { weekday ->
+                                Text(weekday, Modifier.weight(1f), textAlign = androidx.compose.ui.text.style.TextAlign.Center, style = MaterialTheme.typography.labelSmall, color = Color.Gray)
+                            }
+                        }
+                        Spacer(Modifier.height(4.dp))
+                        Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(6.dp)).border(1.dp, calendarGridLine, RoundedCornerShape(6.dp))) {
+                            weeks.forEach { week ->
+                                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top) {
+                                    week.forEach { day ->
+                                        CalendarPriorityDayCell(
+                                            date = day,
+                                            tasks = day?.let { tasksByDate[it].orEmpty() }.orEmpty(),
+                                            select = { day?.let(select) },
+                                            height = dayCellHeight,
+                                            gridLine = calendarGridLine,
+                                            modifier = Modifier.weight(1f)
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                    TextButton(dismiss) { Text("取消") }
+                    if (inputMode) Button(onClick = ::goToInputDate, modifier = Modifier.padding(start = 8.dp)) { Text("前往日期") }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CalendarPriorityDayCell(
+    date: LocalDate?,
+    tasks: List<CalendarPriorityTask>,
+    select: () -> Unit,
+    height: Dp,
+    gridLine: Color,
+    modifier: Modifier = Modifier
+) {
+    val isToday = date == LocalDate.now()
+    var selectionPending by remember(date) { mutableStateOf(false) }
+    LaunchedEffect(selectionPending) {
+        if (selectionPending) {
+            // Keep the standard press ripple visible before the dialog closes.
+            delay(150)
+            select()
+        }
+    }
+    Column(
+        modifier
+            .height(height)
+            .border(.5.dp, gridLine)
+            .clickable(enabled = date != null && !selectionPending) { selectionPending = true }
+            .padding(horizontal = 1.dp, vertical = 1.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        if (date != null) Text(
+            date.dayOfMonth.toString(),
+            color = if (isToday) Color.White else Color.Unspecified,
+            style = MaterialTheme.typography.labelMedium,
+            modifier = if (isToday) Modifier.background(Violet, RoundedCornerShape(50)).padding(horizontal = 5.dp, vertical = 1.dp) else Modifier.padding(vertical = 1.dp)
+        ) else Spacer(Modifier.height(20.dp))
+        tasks.take(5).forEach { task ->
+            val color = if (task.priority == TaskPriority.RED) Color(0xFFD92D20) else Color(0xFFE67E22)
+            BoxWithConstraints(
+                Modifier.fillMaxWidth().padding(top = 1.dp).background(color, RoundedCornerShape(2.dp)).padding(horizontal = 1.dp, vertical = 1.dp)
+            ) {
+                // The sixth CJK glyph is intentionally clipped halfway, signaling more text without an ellipsis.
+                val previewFontSize = (maxWidth.value / 5.5f).sp
+                Text(
+                    task.name,
+                    color = Color.White,
+                    maxLines = 1,
+                    softWrap = false,
+                    overflow = TextOverflow.Clip,
+                    fontSize = previewFontSize,
+                    lineHeight = (previewFontSize.value * 1.18f).sp
+                )
+            }
+        }
+    }
 }
 
 @Composable
@@ -209,14 +372,27 @@ private fun Dashboard(state: MissionUiState, vm: MissionViewModel, chooseDate: (
         }
     }
     val data = if (state.isDateLoading) null else state.dashboard
+    val isToday = state.selectedDate == LocalDate.now()
+    val urgentCards = data?.cards.orEmpty().filter { !it.instance.settled && it.task.priority == TaskPriority.RED }
+    val attentionCards = data?.cards.orEmpty().filter { !it.instance.settled && it.task.priority == TaskPriority.ORANGE }
     val progressPreviewCards = data?.cards.orEmpty()
         .filter { card ->
             card.instance.settled || (
-                state.selectedDate == LocalDate.now() &&
-                    !card.instance.settled && card.task.priority == TaskPriority.RED
+                !card.instance.settled &&
+                    (card.task.priority == TaskPriority.RED || card.task.priority == TaskPriority.ORANGE)
                 )
         }
         .sortedBy { (it.instance.startTimeOverride ?: it.task.startTime).ifBlank { "99:99" } }
+    var showingUrgentReminder by remember { mutableStateOf(true) }
+    LaunchedEffect(urgentCards.size, attentionCards.size, state.selectedDate) {
+        showingUrgentReminder = urgentCards.isNotEmpty()
+        if (urgentCards.isNotEmpty() && attentionCards.isNotEmpty()) {
+            while (true) {
+                delay(2_500)
+                showingUrgentReminder = !showingUrgentReminder
+            }
+        }
+    }
     val entries = remember(data, state.selectedDate, currentTime) {
         val isToday = state.selectedDate == LocalDate.now()
         val scheduledEntries = data?.cards.orEmpty().map(::TaskEntry) + data?.rewards.orEmpty().map(::RewardEntry)
@@ -271,19 +447,33 @@ private fun Dashboard(state: MissionUiState, vm: MissionViewModel, chooseDate: (
                 Box(Modifier.padding(top = 12.dp, start = 16.dp, end = 16.dp)) { DateLoadingCard() }
             } else item {
                 val cards = data?.cards.orEmpty()
-                val urgentCards = cards.filter { !it.instance.settled && it.task.priority == TaskPriority.RED }
                 Card(modifier = Modifier.fillMaxWidth().padding(top = 12.dp, start = 16.dp, end = 16.dp).clickable(enabled = progressPreviewCards.isNotEmpty()) { viewingCompleted = true }) {
                     Column(Modifier.fillMaxWidth().padding(16.dp)) {
                         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                             Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
                                 Text(if (state.selectedDate == LocalDate.now()) "今天進度" else "當日進度", fontWeight = FontWeight.Bold)
-                                if (state.selectedDate == LocalDate.now() && urgentCards.isNotEmpty()) {
-                                    Text(
-                                        "　${urgentCards.size} 項重要未完成",
-                                        color = Color(0xFFD92D20),
-                                        style = MaterialTheme.typography.labelMedium,
-                                        maxLines = 1
-                                    )
+                                if (urgentCards.isNotEmpty() || attentionCards.isNotEmpty()) {
+                                    AnimatedContent(
+                                        targetState = showingUrgentReminder,
+                                        transitionSpec = { fadeIn(tween(200)) togetherWith fadeOut(tween(100)) },
+                                        label = "todayProgressReminder"
+                                    ) { showUrgent ->
+                                        if (showUrgent && urgentCards.isNotEmpty()) {
+                                            Text(
+                                                "　${urgentCards.size} 項重要未完成",
+                                                color = Color(0xFFD92D20),
+                                                style = MaterialTheme.typography.labelMedium,
+                                                maxLines = 1
+                                            )
+                                        } else {
+                                            Text(
+                                                "　${attentionCards.size} 項注意未完成",
+                                                color = Color(0xFFE67E22),
+                                                style = MaterialTheme.typography.labelMedium,
+                                                maxLines = 1
+                                            )
+                                        }
+                                    }
                                 }
                             }
                             Text("本日獲得", style = MaterialTheme.typography.labelSmall)
@@ -331,6 +521,7 @@ private fun Dashboard(state: MissionUiState, vm: MissionViewModel, chooseDate: (
     if (viewingCompleted) CompletedTasksDialog(
         cards = progressPreviewCards,
         categories = state.categories,
+        title = if (isToday) "今天進度" else "當日進度",
         dismiss = { viewingCompleted = false },
         openTask = { card ->
             viewingCompleted = false
@@ -397,12 +588,13 @@ private fun Dashboard(state: MissionUiState, vm: MissionViewModel, chooseDate: (
 }
 
 @Composable
-private fun CompletedTasksDialog(cards: List<TaskCardModel>, categories: List<TaskCategoryEntity>, dismiss: () -> Unit, openTask: (TaskCardModel) -> Unit) {
+private fun CompletedTasksDialog(cards: List<TaskCardModel>, categories: List<TaskCategoryEntity>, title: String, dismiss: () -> Unit, openTask: (TaskCardModel) -> Unit) {
     val urgentCards = cards.filter { !it.instance.settled && it.task.priority == TaskPriority.RED }
+    val attentionCards = cards.filter { !it.instance.settled && it.task.priority == TaskPriority.ORANGE }
     val settledCards = cards.filter { it.instance.settled }
     AlertDialog(
         onDismissRequest = dismiss,
-        title = { Text("今天進度") },
+        title = { Text(title) },
         text = {
             if (cards.isEmpty()) Text("這天尚未有已結算的任務。", color = Color.Gray)
             else LazyColumn(Modifier.heightIn(max = 360.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -410,8 +602,19 @@ private fun CompletedTasksDialog(cards: List<TaskCardModel>, categories: List<Ta
                     item { Text("未完成的重要任務", color = Color(0xFFD92D20), fontWeight = FontWeight.Bold) }
                     items(urgentCards, key = { it.instance.id }) { card -> ProgressPreviewCard(card, categories, openTask) }
                 }
+                if (attentionCards.isNotEmpty()) {
+                    item {
+                        Text(
+                            "未完成的注意任務",
+                            color = Color(0xFFE67E22),
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(top = if (urgentCards.isEmpty()) 0.dp else 8.dp)
+                        )
+                    }
+                    items(attentionCards, key = { it.instance.id }) { card -> ProgressPreviewCard(card, categories, openTask) }
+                }
                 if (settledCards.isNotEmpty()) {
-                    item { Text("已完成任務", fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = if (urgentCards.isEmpty()) 0.dp else 8.dp)) }
+                    item { Text("已完成任務", fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = if (urgentCards.isEmpty() && attentionCards.isEmpty()) 0.dp else 8.dp)) }
                     items(settledCards, key = { it.instance.id }) { card -> ProgressPreviewCard(card, categories, openTask) }
                 }
             }
@@ -423,9 +626,14 @@ private fun CompletedTasksDialog(cards: List<TaskCardModel>, categories: List<Ta
 @Composable
 private fun ProgressPreviewCard(card: TaskCardModel, categories: List<TaskCategoryEntity>, openTask: (TaskCardModel) -> Unit) {
     val isUrgent = !card.instance.settled && card.task.priority == TaskPriority.RED
+    val isAttention = !card.instance.settled && card.task.priority == TaskPriority.ORANGE
     val category = categories.firstOrNull { it.id == card.task.categoryId }
     Card(
-        colors = CardDefaults.cardColors(containerColor = if (isUrgent) Color(0xFFFFEBEE) else Color(0xFFEAF8ED)),
+        colors = CardDefaults.cardColors(containerColor = when {
+            isUrgent -> Color(0xFFFFEBEE)
+            isAttention -> Color(0xFFFFF3E0)
+            else -> Color(0xFFEAF8ED)
+        }),
         modifier = Modifier.fillMaxWidth().clickable { openTask(card) }
     ) {
         Column(Modifier.padding(12.dp)) {
@@ -438,6 +646,7 @@ private fun ProgressPreviewCard(card: TaskCardModel, categories: List<TaskCatego
                 Text(listOf(card.task.startTime, card.task.endTime).filter { it.isNotBlank() }.joinToString(" ～ ").ifBlank { "全天" }, color = Violet, style = MaterialTheme.typography.labelSmall)
             }
             if (isUrgent) Text("⚠ 重要任務未完成", color = Color(0xFFD92D20), style = MaterialTheme.typography.labelSmall)
+            if (isAttention) Text("注意任務未完成", color = Color(0xFFE67E22), style = MaterialTheme.typography.labelSmall)
             Text("完成度 ${completionText(card.instance.completionPercentage)}%", color = Color.Gray, style = MaterialTheme.typography.labelSmall)
             card.instance.result.takeIf { it.isNotBlank() }?.let { result ->
                 Text(result, color = Color.Gray, maxLines = 1, modifier = Modifier.padding(top = 4.dp))
